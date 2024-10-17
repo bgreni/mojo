@@ -25,6 +25,7 @@ from sys import sizeof
 from os import abort
 from memory import Pointer, UnsafePointer, memcpy
 from utils import Span
+from collections._index_normalization import normalize_index
 
 from .optional import Optional
 
@@ -799,17 +800,7 @@ struct List[T: CollectionElement, hint_trivial_type: Bool = False](
             A reference to the element at the given index.
         """
 
-        var normalized_idx = idx
-
-        debug_assert(
-            -self.size <= normalized_idx < self.size,
-            "index: ",
-            normalized_idx,
-            " is out of bounds for `List` of size: ",
-            self.size,
-        )
-        if normalized_idx < 0:
-            normalized_idx += len(self)
+        var normalized_idx = normalize_index["List"](idx, self)
 
         return (self.data + normalized_idx)[]
 
