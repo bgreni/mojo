@@ -17,6 +17,7 @@ from std.math import ceil, floor
 from std.algorithm.functional import elementwise
 from std.algorithm.reduction import _get_nd_indices_from_flat_index
 from std.gpu.host import DeviceContext
+from std.gpu.host.info import is_gpu
 from layout import (
     Coord,
     TensorLayout,
@@ -69,10 +70,11 @@ def coord_transform[
         if out_dim == 1:
             return 0
         # note: resized image will have same corners as original image
-        return (
-            out_coord_f32
-            * (Float64(in_dim - 1) / Float64(out_dim - 1)).cast[DType.float32]()
-        )
+        # The ratio is computed in Float32 (not Float64) so this branch
+        # compiles for Metal, which has no double-precision support. For image
+        # dimensions the result is identical to the Float64 computation once
+        # rounded to Float32.
+        return out_coord_f32 * (Float32(in_dim - 1) / Float32(out_dim - 1))
     elif mode == CoordinateTransformationMode.Asymmetric:
         return out_coord_f32 / scale
     else:
@@ -137,6 +139,7 @@ struct Interpolator[mode: InterpolationMode](
 def resize_nearest_neighbor[
     coordinate_transformation_mode: CoordinateTransformationMode,
     round_mode: RoundMode,
+    target: StaticString,
     dtype: DType,
 ](
     input: TileTensor[mut=False, dtype, ...],
@@ -191,8 +194,10 @@ def resize_nearest_neighbor[
 
         output.raw_store(out_idx, input.ptr[in_idx])
 
-    # TODO (#21439): can use unsafe_memcpy when scale on inner dimension is 1
-    elementwise[1](nn_interpolate, output.layout.shape_coord(), ctx)
+    # TODO (#21439): can use memcpy when scale on inner dimension is 1
+    elementwise[1, target=target](
+        nn_interpolate, output.layout.shape_coord(), ctx
+    )
 
 
 @always_inline
@@ -270,13 +275,15 @@ def interpolate_point_1d[
 def resize_linear[
     coordinate_transformation_mode: CoordinateTransformationMode,
     antialias: Bool,
+    target: StaticString,
     dtype: DType,
 ](
     input: TileTensor[mut=True, dtype, address_space=AddressSpace.GENERIC, ...],
     output: TileTensor[
         mut=True, dtype, address_space=AddressSpace.GENERIC, ...
     ],
-):
+    ctx: DeviceContext,
+) raises:
     """Resizes input to output shape using linear interpolation.
 
     Does not use anti-aliasing filter for downsampling (coming soon).
@@ -285,20 +292,165 @@ def resize_linear[
         coordinate_transformation_mode: How to map a coordinate in output to a coordinate in input.
         antialias: Whether or not to use an antialiasing linear/cubic filter, which when downsampling, uses
             more points to avoid aliasing artifacts. Effectively stretches the filter by a factor of 1 / scale.
+        target: The device the resize runs on ("cpu" or "gpu").
         dtype: Type of input and output.
 
     Args:
         input: The input to be resized.
         output: The output containing the resized input.
+        ctx: Device context used to enqueue GPU kernels (unused on CPU).
 
 
     """
     _resize[
-        InterpolationMode.Linear, coordinate_transformation_mode, antialias
-    ](input, output)
+        InterpolationMode.Linear,
+        coordinate_transformation_mode,
+        antialias,
+        target,
+    ](input, output, ctx)
 
 
 def _resize[
+    interpolation_mode: InterpolationMode,
+    coordinate_transformation_mode: CoordinateTransformationMode,
+    antialias: Bool,
+    target: StaticString,
+    dtype: DType,
+](
+    input: TileTensor[mut=True, dtype, address_space=AddressSpace.GENERIC, ...],
+    output: TileTensor[
+        mut=True, dtype, address_space=AddressSpace.GENERIC, ...
+    ],
+    ctx: DeviceContext,
+) raises:
+    comptime if is_gpu[target]():
+        return _resize_gpu[
+            interpolation_mode,
+            coordinate_transformation_mode,
+            antialias,
+            target,
+        ](input, output, ctx)
+
+    _resize_cpu[
+        interpolation_mode, coordinate_transformation_mode, antialias
+    ](input, output)
+
+
+@always_inline
+def _resize_copy[
+    target: StaticString,
+    dtype: DType,
+    InLayout: TensorLayout,
+    OutLayout: TensorLayout,
+](
+    src: TileTensor[
+        mut=False, dtype, InLayout, address_space=AddressSpace.GENERIC, ...
+    ],
+    dst: TileTensor[
+        mut=True, dtype, OutLayout, address_space=AddressSpace.GENERIC, ...
+    ],
+    ctx: DeviceContext,
+) raises:
+    """Elementwise device-to-device copy of `src` into `dst` (same shape)."""
+
+    def copy_fn[simd_width: Int, alignment: Int = 1](coords: Coord) {var}:
+        dst.raw_store(dst.layout(coords), src.raw_load(src.layout(coords)))
+
+    elementwise[1, target=target](copy_fn, dst.layout.shape_coord(), ctx)
+
+
+def _resize_gpu[
+    interpolation_mode: InterpolationMode,
+    coordinate_transformation_mode: CoordinateTransformationMode,
+    antialias: Bool,
+    target: StaticString,
+    dtype: DType,
+](
+    input: TileTensor[mut=True, dtype, address_space=AddressSpace.GENERIC, ...],
+    output: TileTensor[
+        mut=True, dtype, address_space=AddressSpace.GENERIC, ...
+    ],
+    ctx: DeviceContext,
+) raises:
+    """Separable linear resize for GPU targets.
+
+    Runs one `elementwise` 1D-interpolation pass per resized dimension,
+    ping-ponging through device scratch buffers. Kept separate from the CPU
+    path because device buffers do not expose raw pointers on every target
+    (e.g. Metal), so the pointer-based CPU implementation cannot be reused.
+    """
+    comptime assert (
+        input.rank == output.rank
+    ), "input rank must match output rank"
+
+    var scales = StaticTuple[Float32, input.rank]()
+    var resize_dims = List[Int](capacity=input.rank)
+    for i in range(input.rank):
+        scales[i] = (Float64(output.dim(i)) / Float64(input.dim(i))).cast[
+            DType.float32
+        ]()
+        if Int(input.dim(i)) != Int(output.dim(i)):
+            resize_dims.append(i)
+
+    # No dimension changes size: copy the input straight into the output.
+    if len(resize_dims) == 0:
+        return _resize_copy[target=target](input, output, ctx)
+
+    var interpolator = Interpolator[interpolation_mode]()
+    var in_shape = coord_to_index_list(input.layout.shape_coord())
+    var out_shape_full = coord_to_index_list(output.layout.shape_coord())
+
+    # Stage the input into a scratch buffer so every interpolation pass can
+    # ping-pong between uniform, buffer-backed tensors.
+    var src_buf = ctx.enqueue_create_buffer[dtype](in_shape.flattened_length())
+    _resize_copy[target=target](
+        input, TileTensor(src_buf, row_major(Coord(in_shape))), ctx
+    )
+
+    # Interpolation is separable, so interpolate one resized dim at a time.
+    for dim_idx in range(len(resize_dims)):
+        var resize_dim = resize_dims[dim_idx]
+        var out_shape = in_shape
+        out_shape[resize_dim] = out_shape_full[resize_dim]
+
+        var src = TileTensor(src_buf, row_major(Coord(in_shape)))
+        var dst_buf = ctx.enqueue_create_buffer[dtype](
+            out_shape.flattened_length()
+        )
+        var dst = TileTensor(dst_buf, row_major(Coord(out_shape)))
+        var scale = scales[resize_dim]
+
+        def interp_pass[
+            simd_width: Int, alignment: Int = 1
+        ](out_coords: Coord) {var}:
+            interpolate_point_1d[
+                InputLayoutType = src.LayoutType,
+                coordinate_transformation_mode,
+                antialias,
+            ](
+                interpolator,
+                resize_dim,
+                rebind[IndexList[src.rank]](coord_to_index_list(out_coords)),
+                scale,
+                src,
+                dst,
+            )
+
+        elementwise[1, target=target](
+            interp_pass, dst.layout.shape_coord(), ctx
+        )
+
+        in_shape = out_shape
+        src_buf = dst_buf^
+
+    # Copy the final ping-pong result into the caller's output tensor.
+    _resize_copy[target=target](
+        TileTensor(src_buf, row_major(Coord(in_shape))), output, ctx
+    )
+    _ = src_buf^
+
+
+def _resize_cpu[
     interpolation_mode: InterpolationMode,
     coordinate_transformation_mode: CoordinateTransformationMode,
     antialias: Bool,

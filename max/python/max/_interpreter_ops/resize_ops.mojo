@@ -121,6 +121,7 @@ def _resize_linear_impl[
     in_ptr: UnsafePointer[Scalar[dtype], MutUntrackedOrigin],
     in_shape: InlineArray[Int, MAX_RANK],
     out_shape: InlineArray[Int, MAX_RANK],
+    ctx: DeviceContext,
 ) raises:
     """Resize input into output using a compile-time-specialised linear filter.
 
@@ -139,6 +140,7 @@ def _resize_linear_impl[
         in_ptr: Input buffer pointer.
         in_shape: Input shape; entries 0..rank-1 are valid.
         out_shape: Output shape; entries 0..rank-1 are valid.
+        ctx: Device context.
     """
     var in_idx = IndexList[rank](0)
     var out_idx = IndexList[rank](0)
@@ -149,8 +151,8 @@ def _resize_linear_impl[
     var in_tt = TileTensor(in_ptr, row_major(Coord(in_idx)))
     var out_tt = TileTensor(out_ptr, row_major(Coord(out_idx)))
 
-    resize_linear[CoordinateTransformationMode(coord_mode), antialias](
-        in_tt, out_tt
+    resize_linear[CoordinateTransformationMode(coord_mode), antialias, "cpu"](
+        in_tt, out_tt, ctx
     )
 
 
@@ -173,29 +175,30 @@ struct _ResizeLinearBody[coord_mode: Int, antialias: Bool](Dispatchable):
     var in_shape: InlineArray[Int, MAX_RANK]
     var out_shape: InlineArray[Int, MAX_RANK]
     var rank: Int
+    var ctx: DeviceContext
 
     def call[t: DType](self) raises -> None:
         var out_ptr = _make_ptr[t](self.out_addr)
         var in_ptr = _make_ptr[t](self.in_addr)
         if self.rank == 1:
             _resize_linear_impl[Self.coord_mode, Self.antialias, t, 1](
-                out_ptr, in_ptr, self.in_shape, self.out_shape
+                out_ptr, in_ptr, self.in_shape, self.out_shape, self.ctx
             )
         elif self.rank == 2:
             _resize_linear_impl[Self.coord_mode, Self.antialias, t, 2](
-                out_ptr, in_ptr, self.in_shape, self.out_shape
+                out_ptr, in_ptr, self.in_shape, self.out_shape, self.ctx
             )
         elif self.rank == 3:
             _resize_linear_impl[Self.coord_mode, Self.antialias, t, 3](
-                out_ptr, in_ptr, self.in_shape, self.out_shape
+                out_ptr, in_ptr, self.in_shape, self.out_shape, self.ctx
             )
         elif self.rank == 4:
             _resize_linear_impl[Self.coord_mode, Self.antialias, t, 4](
-                out_ptr, in_ptr, self.in_shape, self.out_shape
+                out_ptr, in_ptr, self.in_shape, self.out_shape, self.ctx
             )
         else:
             _resize_linear_impl[Self.coord_mode, Self.antialias, t, 5](
-                out_ptr, in_ptr, self.in_shape, self.out_shape
+                out_ptr, in_ptr, self.in_shape, self.out_shape, self.ctx
             )
 
 
@@ -209,6 +212,7 @@ def _dispatch_coord_mode[
     in_shape: InlineArray[Int, MAX_RANK],
     out_shape: InlineArray[Int, MAX_RANK],
     rank: Int,
+    ctx: DeviceContext,
 ) raises:
     """Dispatch over the four coordinate transformation modes.
 
@@ -223,6 +227,7 @@ def _dispatch_coord_mode[
         in_shape: Input shape (first ``rank`` entries valid).
         out_shape: Output shape (first ``rank`` entries valid).
         rank: Tensor rank.
+        ctx: Device context.
 
     Raises:
         Error: If ``coord_mode`` is not 0–3.
@@ -230,28 +235,28 @@ def _dispatch_coord_mode[
     if coord_mode == 0:
         _dispatch_float_dtype(
             _ResizeLinearBody[0, antialias](
-                out_addr, in_addr, in_shape, out_shape, rank
+                out_addr, in_addr, in_shape, out_shape, rank, ctx
             ),
             dtype,
         )
     elif coord_mode == 1:
         _dispatch_float_dtype(
             _ResizeLinearBody[1, antialias](
-                out_addr, in_addr, in_shape, out_shape, rank
+                out_addr, in_addr, in_shape, out_shape, rank, ctx
             ),
             dtype,
         )
     elif coord_mode == 2:
         _dispatch_float_dtype(
             _ResizeLinearBody[2, antialias](
-                out_addr, in_addr, in_shape, out_shape, rank
+                out_addr, in_addr, in_shape, out_shape, rank, ctx
             ),
             dtype,
         )
     elif coord_mode == 3:
         _dispatch_float_dtype(
             _ResizeLinearBody[3, antialias](
-                out_addr, in_addr, in_shape, out_shape, rank
+                out_addr, in_addr, in_shape, out_shape, rank, ctx
             ),
             dtype,
         )
@@ -270,15 +275,12 @@ def resize_linear_dispatcher(
 ) raises:
     """Linear resize dispatcher: unwraps PythonObjects and dispatches by dtype.
 
-    The ``device_context_ptr`` argument is accepted for API uniformity but
-    unused — ``resize_linear`` is a CPU-only kernel.
-
     Args:
         out_buffer: Output buffer (pre-allocated with output shape).
         in_buffer: Input data buffer.
         params: Python tuple ``(coord_mode, antialias, rank,
             in_shape_list, out_shape_list)``.
-        device_context_ptr: Device context pointer (unused, CPU-only).
+        device_context_ptr: Device context pointer.
     """
     var dtype = _get_dtype(in_buffer)
     var coord_mode = Int(py=params[0])
@@ -288,14 +290,15 @@ def resize_linear_dispatcher(
     var out_shape = _get_shape(params[4], rank)
     var out_addr = Int(py=out_buffer._data_ptr())
     var in_addr = Int(py=in_buffer._data_ptr())
+    var ctx = _get_ctx(device_context_ptr)
 
     if antialias:
         _dispatch_coord_mode[True](
-            coord_mode, dtype, out_addr, in_addr, in_shape, out_shape, rank
+            coord_mode, dtype, out_addr, in_addr, in_shape, out_shape, rank, ctx
         )
     else:
         _dispatch_coord_mode[False](
-            coord_mode, dtype, out_addr, in_addr, in_shape, out_shape, rank
+            coord_mode, dtype, out_addr, in_addr, in_shape, out_shape, rank, ctx
         )
 
 
@@ -347,7 +350,7 @@ def _resize_nearest_impl[
     var out_tt = TileTensor(out_ptr, row_major(Coord(out_idx)))
 
     resize_nearest_neighbor[
-        CoordinateTransformationMode(coord_mode), RoundMode(round_mode)
+        CoordinateTransformationMode(coord_mode), RoundMode(round_mode), "cpu"
     ](in_tt, out_tt, ctx)
 
 

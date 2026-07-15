@@ -34,7 +34,7 @@ def main() raises:
         var output = TileTensor(output_stack, row_major[1, 1, 4, 6]())
 
         resize_nearest_neighbor[
-            CoordinateTransformationMode.HalfPixel, RoundMode.HalfDown
+            CoordinateTransformationMode.HalfPixel, RoundMode.HalfDown, target="cpu"
         ](input, output, ctx)
 
         for i in range(24):
@@ -63,7 +63,7 @@ def main() raises:
         var output = TileTensor(output_stack, row_major[1, 1, 1, 2]())
 
         resize_nearest_neighbor[
-            CoordinateTransformationMode.HalfPixel, RoundMode.HalfDown
+            CoordinateTransformationMode.HalfPixel, RoundMode.HalfDown, target="cpu"
         ](input, output, ctx)
 
         for i in range(2):
@@ -102,7 +102,7 @@ def main() raises:
         var output = TileTensor(output_stack, row_major[1, 1, 1, 2]())
 
         resize_nearest_neighbor[
-            CoordinateTransformationMode.HalfPixel1D, RoundMode.HalfDown
+            CoordinateTransformationMode.HalfPixel1D, RoundMode.HalfDown, target="cpu"
         ](input, output, ctx)
 
         for i in range(2):
@@ -122,7 +122,7 @@ def main() raises:
         var output = TileTensor(output_stack, row_major[1, 1, 7, 8]())
 
         resize_nearest_neighbor[
-            CoordinateTransformationMode.HalfPixel, RoundMode.HalfDown
+            CoordinateTransformationMode.HalfPixel, RoundMode.HalfDown, target="cpu"
         ](input, output, ctx)
 
         for i in range(56):
@@ -161,7 +161,7 @@ def main() raises:
         var output = TileTensor(output_stack, row_major[1, 1, 8, 8]())
 
         resize_nearest_neighbor[
-            CoordinateTransformationMode.AlignCorners, RoundMode.Floor
+            CoordinateTransformationMode.AlignCorners, RoundMode.Floor, target="cpu"
         ](input, output, ctx)
 
         for i in range(64):
@@ -200,7 +200,7 @@ def main() raises:
         var output = TileTensor(output_stack, row_major[1, 1, 8, 8]())
 
         resize_nearest_neighbor[
-            CoordinateTransformationMode.Asymmetric, RoundMode.HalfUp
+            CoordinateTransformationMode.Asymmetric, RoundMode.HalfUp, target="cpu"
         ](input, output, ctx)
 
         for i in range(64):
@@ -237,7 +237,7 @@ def main() raises:
         var output = TileTensor(output_stack, row_major[1, 1, 8, 8]())
 
         resize_nearest_neighbor[
-            CoordinateTransformationMode.HalfPixel, RoundMode.Ceil
+            CoordinateTransformationMode.HalfPixel, RoundMode.Ceil, target="cpu"
         ](input, output, ctx)
 
         for i in range(64):
@@ -280,8 +280,8 @@ def main() raises:
             4.0000,
         ]
 
-        resize_linear[CoordinateTransformationMode.HalfPixel, False](
-            input, output
+        resize_linear[CoordinateTransformationMode.HalfPixel, False, target="cpu"](
+            input, output, ctx
         )
 
         for i in range(16):
@@ -325,8 +325,8 @@ def main() raises:
             4.0000,
         ]
 
-        resize_linear[CoordinateTransformationMode.AlignCorners, False](
-            input, output
+        resize_linear[CoordinateTransformationMode.AlignCorners, False, target="cpu"](
+            input, output, ctx
         )
 
         for i in range(16):
@@ -363,8 +363,8 @@ def main() raises:
             5.50000,
         ]
 
-        resize_linear[CoordinateTransformationMode.HalfPixel, False](
-            input, output
+        resize_linear[CoordinateTransformationMode.HalfPixel, False, target="cpu"](
+            input, output, ctx
         )
 
         for i in range(2):
@@ -400,8 +400,8 @@ def main() raises:
         # print(y.flatten())
         var reference_stack: InlineArray[Float32, 2] = [Float32(1), 4]
 
-        resize_linear[CoordinateTransformationMode.AlignCorners, False](
-            input, output
+        resize_linear[CoordinateTransformationMode.AlignCorners, False, target="cpu"](
+            input, output, ctx
         )
 
         for i in range(2):
@@ -463,8 +463,8 @@ def main() raises:
         ]
         # fmt: on
 
-        resize_linear[CoordinateTransformationMode.HalfPixel, False](
-            input, output
+        resize_linear[CoordinateTransformationMode.HalfPixel, False, target="cpu"](
+            input, output, ctx
         )
 
         for i in range(96):
@@ -514,8 +514,8 @@ def main() raises:
             11.42857,
         ]
 
-        resize_linear[CoordinateTransformationMode.HalfPixel, True](
-            input, output
+        resize_linear[CoordinateTransformationMode.HalfPixel, True, target="cpu"](
+            input, output, ctx
         )
 
         for i in range(4):
@@ -542,8 +542,8 @@ def main() raises:
             1.0000,
         ]
 
-        resize_linear[CoordinateTransformationMode.HalfPixel, False](
-            input, output
+        resize_linear[CoordinateTransformationMode.HalfPixel, False, target="cpu"](
+            input, output, ctx
         )
 
         for i in range(4):
