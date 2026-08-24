@@ -431,6 +431,578 @@ FailureOr<TypedAttr> StructFieldNamesAttr::evaluateWithContext(
 }
 
 //===----------------------------------------------------------------------===//
+// Decorator Reflection Attrs
+//===----------------------------------------------------------------------===//
+
+namespace {
+/// A struct declaration plus the decorators applied to it, or to one of its
+/// fields.
+struct DecoratorSite {
+  /// The resolved struct. `decl` is null when async concretization was
+  /// triggered and the caller should retry later.
+  ResolvedStructHandle resolved;
+  /// The stored decorator values, in application order.
+  SmallVector<TypedAttr> decorators;
+  /// The decorator struct each value came from, parallel to `decorators`.
+  /// Individual entries may be null when identity is unrecoverable.
+  SmallVector<SymbolRefAttr> typeNames;
+  /// The type of the decorated declaration -- the struct's own type for a
+  /// struct decorator, the field's type for a field decorator. This is the
+  /// value the compiler bound the (at most one) parameter of every decorator
+  /// here to, so it is the second half of decorator identity: base-struct
+  /// symbol plus this reconstructs the full parameterization. Null when it
+  /// could not be recovered, in which case the parameterization is not
+  /// checked and identity falls back to the symbol alone.
+  ///
+  /// A field's type may reference the site struct's own parameters, in which
+  /// case `siteTypeNeedsRebinding` is set and it is rebound through the same
+  /// evaluator the stored decorator values are. A struct's own type comes
+  /// straight from the attribute's operand and is already in the caller's
+  /// world, so it must not be.
+  TypedAttr siteType;
+  bool siteTypeNeedsRebinding = false;
+};
+
+/// A decorator query decoded into the two halves of decorator identity: the
+/// base struct's symbol, and the parameterization the caller spelled.
+struct DecoratorQuery {
+  /// The decorator struct's identity symbol, in the namespace the site
+  /// records identity in. Null when the operand does not (yet) name a struct.
+  SymbolRefAttr symbol;
+  /// The parameter values bound in the query (`tagged[Int]` -> `[Int]`).
+  /// Empty for an unparameterized decorator struct -- but only meaningful
+  /// when `parameterizationResolved` is set.
+  ArrayRef<TypedAttr> paramValues;
+  /// Whether `paramValues` could be determined at all. When false the query
+  /// matches nothing, rather than matching on the symbol alone: skipping the
+  /// check would be a *wrong-answer* path, handing back a stored
+  /// `tagged[String]` in a list typed `tagged[Int]`.
+  bool parameterizationResolved = true;
+
+  explicit operator bool() const { return static_cast<bool>(symbol); }
+};
+
+/// Reduce a parameter value that denotes a type to the type it denotes, so
+/// that two spellings differing only in metatype (`!kgen.type` versus a trait
+/// metatype, with or without a wrapper) still compare equal. Returns null when
+/// the value does not denote a type.
+Type asTypeValue(TypedAttr attr) {
+  if (auto typeParam = sugarDynCastIfPresent<TypeParamAttr>(attr))
+    return typeParam.getTypeValue();
+  return {};
+}
+} // namespace
+
+/// Decode the `decoratorType` operand of a `*_decorator_of` attribute into the
+/// identity symbol to compare against `StructDeclInterface::
+/// get{Struct,Field}DecoratorTypeNames`, plus the parameterization the caller
+/// spelled. Returns a falsy query if the operand does not (yet) name a struct
+/// declaration.
+///
+/// Identity has to be compared on the decorator's struct rather than on the
+/// stored value's type, because lowering anonymizes that type: a fieldless
+/// decorator becomes `#kgen.struct<> : !kgen.struct<() memoryOnly>`, which is
+/// byte-identical for two different decorator structs.
+///
+/// The symbol is not quite the whole of identity, because a decorator struct
+/// may declare one parameter. It is *almost* the whole of it: that parameter
+/// is bound by the compiler to the type of the decorated declaration, never
+/// to anything the user chose, so base-struct symbol plus the site
+/// reconstructs the parameterization exactly. `paramValues` is therefore
+/// checked against the site's own type (see `packDecorators`) rather than
+/// against anything recorded per stored value.
+///
+/// The symbol namespace depends on which op `site` is, because the two
+/// implementations of the interface record identity differently:
+///
+///  * `lit.struct.decl` (parser) reports the LIT struct symbol carried by the
+///    decorator value's own type, e.g. `@mod::@serde`.
+///  * `kgen.struct.generator` (KGEN symbol table, LowerLIT, and both
+///    elaborators) reports the flattened generator symbol LowerLIT recorded,
+///    e.g. `@"mod::serde"`.
+///
+/// Resolving the operand through the *same* context is what makes the second
+/// case agree: whichever form the operand takes -- a LIT struct type value
+/// under LowerLIT, a `genref`, or the `instref` an elaborator produces for a
+/// concretized type -- `resolveStructOp` lands it on the generator whose
+/// `sym_name` the recorded identity is.
+static DecoratorQuery decodeDecoratorQuery(ParameterEvaluationContext &context,
+                                           StructDeclInterface site,
+                                           TypedAttr decoratorType) {
+  if (!isa<StructGeneratorOp>(site.getOperation())) {
+    // Parser: the operand is a struct type value of exactly the shape the
+    // stored identity was read from, so the symbol needs no resolution.
+    auto typeParam = sugarDynCastIfPresent<TypeParamAttr>(decoratorType);
+    if (!typeParam)
+      return {};
+    auto named =
+        sugarDynCastIfPresent<StructTypeInterface>(typeParam.getTypeValue());
+    if (!named)
+      return {};
+    // The parameterization does need resolving, and through the same route
+    // the *site* is resolved by (`resolveDecoratorSite`), so the two are
+    // spelled in the same world when compared. A failure makes the query
+    // match nothing rather than fall back to matching on the symbol alone:
+    // the latter would return a stored `tagged[String]` in a list typed
+    // `tagged[Int]`.
+    //
+    // Failing closed costs nothing in practice. `LIT::StructType` is the only
+    // implementer of `StructTypeInterface`, so reaching here at all means the
+    // operand *is* a LIT struct type value; the resolution that follows can
+    // then only fail if resolving the decorator struct's own body fails --
+    // which is separately diagnosed, so there is no silently-lost match.
+    FailureOr<ResolvedStructHandle> queryOr =
+        context.resolveStructOp(decoratorType, /*acceptAsync=*/false);
+    if (failed(queryOr) || !queryOr->decl)
+      return {named.getSymbolRef(), {}, /*parameterizationResolved=*/false};
+    return {named.getSymbolRef(), queryOr->paramValues};
+  }
+
+  FailureOr<ResolvedStructHandle> queryOr =
+      context.resolveStructOp(decoratorType, /*acceptAsync=*/false);
+  if (failed(queryOr) || !queryOr->decl)
+    return {};
+  auto gen = dyn_cast<StructGeneratorOp>(queryOr->decl.getOperation());
+  if (!gen)
+    return {};
+  return {SymbolRefAttr::get(gen.getSymNameAttr()), queryOr->paramValues};
+}
+
+/// Resolve the struct named by `typeValue` and collect the decorators applied
+/// to the struct itself, or -- when `fieldIndex` is non-null -- to the field
+/// it indexes. `attrName` names the attribute in diagnostics.
+///
+/// Returns `failure()` when `typeValue` is not a struct type (a materialization
+/// error is emitted), when `fieldIndex` is out of range (likewise), or when
+/// `fieldIndex` has not folded to a constant yet (silently, to be retried).
+/// A returned site with a null `resolved.decl` means async concretization was
+/// triggered and the caller should return a null result to be retried.
+static FailureOr<DecoratorSite>
+resolveDecoratorSite(ParameterEvaluationContext &context, StringRef attrName,
+                     TypedAttr typeValue, TypedAttr fieldIndex) {
+  // Wait until the index has folded to a constant (it may be a nested
+  // struct_field_index_by_name or a Mojo Int parameter expression).
+  IntegerAttr fieldIndexAttr;
+  if (fieldIndex) {
+    fieldIndexAttr = dyn_cast<IntegerAttr>(fieldIndex);
+    if (!fieldIndexAttr)
+      return failure();
+  }
+
+  FailureOr<ResolvedStructHandle> resolvedOr =
+      context.resolveStructOp(typeValue, /*acceptAsync=*/false);
+  if (failed(resolvedOr)) {
+    context.emitMaterializationError(Twine(attrName) +
+                                     " requires a struct type");
+    return failure();
+  }
+
+  DecoratorSite site;
+  site.resolved = *resolvedOr;
+  if (!site.resolved.decl)
+    return site; // Async: not ready yet.
+
+  if (!fieldIndexAttr) {
+    site.resolved.decl.getStructDecorators(site.decorators);
+    site.resolved.decl.getStructDecoratorTypeNames(site.typeNames);
+    // A struct decorator's site type is the struct's own type -- which is
+    // exactly the operand that named it. Already in the caller's world, so
+    // unlike the field case it must *not* be rebound through the struct's
+    // own parameter scope.
+    site.siteType = typeValue;
+    return site;
+  }
+
+  SmallVector<StringAttr> fieldNames;
+  site.resolved.decl.getFieldNames(fieldNames);
+  int64_t index = fieldIndexAttr.getInt();
+  if (index < 0 || index >= int64_t(fieldNames.size())) {
+    context.emitMaterializationError(
+        Twine(attrName) + ": field index " + Twine(index) +
+        " out of range for struct with " + Twine(fieldNames.size()) +
+        " fields");
+    return failure();
+  }
+  site.resolved.decl.getFieldDecorators(size_t(index), site.decorators);
+  site.resolved.decl.getFieldDecoratorTypeNames(size_t(index), site.typeNames);
+  // A field decorator's site type is the field's type. It may reference the
+  // struct's parameters, so it is rebound alongside the decorator values --
+  // `siteTypeNeedsRebinding` records that.
+  SmallVector<TypedAttr> fieldTypes;
+  site.resolved.decl.getFieldTypes(
+      fieldTypes, TypeType::get(site.resolved.decl.getContext()));
+  if (size_t(index) < fieldTypes.size()) {
+    site.siteType = fieldTypes[size_t(index)];
+    site.siteTypeNeedsRebinding = true;
+  }
+  return site;
+}
+
+/// Shared tail for the `*_decorator_of` attributes: rebind each stored
+/// decorator (a value that may refer to the struct's own parameters) through
+/// the struct's parameter values, keep the ones the `wanted` query identifies,
+/// and package the result as a param_list of `resultType`.
+///
+/// Rebinding still happens for every stored decorator, including the ones
+/// `wanted` filters out, so that a decorator whose payload depends on the
+/// struct's parameters is specialized before anything else looks at it.
+///
+/// Matching is on the two halves of decorator identity. The base struct's
+/// symbol is compared per entry, against the parallel identity array. The
+/// parameterization is compared once, for the query as a whole, against the
+/// site's own type: a decorator struct's single parameter is always bound by
+/// the compiler to the type of the declaration it is attached to, so every
+/// decorator recorded at this site carries the same binding and the query
+/// either agrees with it or matches nothing here. That is what keeps
+/// `decorator_of[tagged[String]]` from answering on an `Int` field, and it
+/// needs no per-value record beyond the symbol.
+static FailureOr<TypedAttr>
+packDecorators(ParameterEvaluationContext &context, DecoratorSite &site,
+               ParamListType resultType, const DecoratorQuery &wanted) {
+  FailureOr<TypedAttr> result = failure();
+  context.withEvaluator(
+      site.resolved.decl.getInputParams(), site.resolved.paramValues,
+      [&](ParameterEvaluator &evaluator) {
+        // The query is parameterized iff the decorator struct declares a
+        // parameter; when it does, it must be the site's type. A site type
+        // that could not be recovered at all matches nothing, which is the
+        // same fail-closed answer `decoratorValueTypeAttr` gives to that
+        // condition -- see the note there.
+        std::optional<bool> parameterizationMatches;
+        if (!wanted.parameterizationResolved) {
+          parameterizationMatches = false;
+        } else if (!wanted.paramValues.empty()) {
+          TypedAttr siteType = site.siteType;
+          if (siteType && site.siteTypeNeedsRebinding)
+            siteType = evaluator.getReboundAttribute(siteType);
+          Type siteTypeValue = asTypeValue(siteType);
+          Type queryTypeValue = asTypeValue(wanted.paramValues.front());
+          // Canonical equality, not pointer equality: a field's declared type
+          // keeps its sugar (`!kgen.param<:meta<!Int> #alias_Int>`) while the
+          // query's parameterization arrives desugared (`!Int`).
+          parameterizationMatches = wanted.paramValues.size() == 1 &&
+                                    siteTypeValue && queryTypeValue &&
+                                    isEqualCanon(queryTypeValue, siteTypeValue);
+        }
+
+        SmallVector<TypedAttr> resultAttrs;
+        for (auto [i, decorator] : llvm::enumerate(site.decorators)) {
+          TypedAttr rebound = evaluator.getReboundAttribute(decorator);
+          if (!rebound) {
+            result = TypedAttr();
+            return;
+          }
+          SymbolRefAttr typeName =
+              i < site.typeNames.size() ? site.typeNames[i] : SymbolRefAttr();
+          if (typeName != wanted.symbol)
+            continue;
+          if (parameterizationMatches && !*parameterizationMatches)
+            continue;
+          resultAttrs.push_back(rebound);
+        }
+        result = cast<TypedAttr>(ParamListAttr::get(resultAttrs, resultType));
+      });
+  return result;
+}
+
+/// Find the `kgen.struct.generator` a recorded decorator-identity symbol names,
+/// searching outward from `site` through enclosing symbol tables.
+///
+/// `SymbolTable::lookupNearestSymbolFrom` is not enough: a struct generator is
+/// itself a symbol table, so that helper searches only *inside* the decorated
+/// struct and stops. Decorator generators are siblings at module scope.
+///
+/// Returns null when the symbol cannot be found. Callers must treat that as
+/// *unrecoverable identity*, not as "no parameters": a decorator that does
+/// declare one would otherwise get an arity-mismatched `genref`, which is the
+/// shape that asserts in name mangling.
+///
+/// That is a deliberate trade, not a free one. A miss on a *parameterless*
+/// decorator used to be harmless -- the reference it produced bound nothing
+/// either way, so identity survived -- and now costs identity there too. Both
+/// readings cannot be had at once without knowing the parameter count, which
+/// is exactly what a miss denies, so this fails closed: a wrong (empty)
+/// answer beats an assertion. A miss should be unreachable regardless; see
+/// the note in `decoratorValueTypeAttr`.
+static StructGeneratorOp lookupStructGeneratorFrom(StructDeclInterface site,
+                                                   SymbolRefAttr symbol) {
+  for (Operation *op = site.getOperation(); op; op = op->getParentOp())
+    if (op->hasTrait<OpTrait::SymbolTable>())
+      if (auto gen =
+              dyn_cast_if_present<StructGeneratorOp>(
+                  SymbolTable::lookupSymbolIn(op, symbol)))
+        return gen;
+  return nullptr;
+}
+
+/// Build the type value that `*_decorator_types` reports for one stored
+/// decorator, given the rebound value's own type and the identity symbol
+/// recorded alongside it.
+///
+/// This is the emitting counterpart of `decodeDecoratorQuery`, and it splits
+/// on the same thing -- which op the site is -- for the same reason:
+///
+///  * `lit.struct.decl` (parser): the value's type is still
+///    `!lit.struct<@mod::@serde>`, which names the decorator struct, so it is
+///    reported as-is.
+///  * `kgen.struct.generator` (post-LowerLIT, both elaborators): the value's
+///    type has been anonymized to a bare `!kgen.struct<...>`, identical for
+///    any two fieldless decorators. Reporting it would make
+///    `decorator_types()[0] == tag` false for the decorator that is actually
+///    there and true for a different one, so the type-domain half is rebuilt
+///    from the recorded generator symbol instead; the anonymized type stays
+///    on as the value-domain half, which is what it correctly describes.
+///
+/// A decorator struct may declare one parameter, and it is always bound to
+/// `siteType` -- the type of the decorated declaration. The rebuilt reference
+/// has to bind it too: an arity-mismatched `genref` is not merely a wrong
+/// answer, it asserts in name mangling, and a caller feeding
+/// `decorator_types()` back into `decorator_of` (see `packDecorators`) must
+/// get the same parameterization back that the query has to spell.
+///
+/// Falls back to the value's own type when identity was not recoverable
+/// (a null `typeName`) -- the same "unknown identity" encoding that makes a
+/// stored decorator match no `*_decorator_of` query.
+///
+/// Returns null when the rebuilt reference is not resolvable yet, which the
+/// caller treats the same way it treats a value that has not rebound.
+static TypedAttr decoratorValueTypeAttr(ParameterEvaluator &evaluator,
+                                        StructDeclInterface site,
+                                        SymbolRefAttr typeName, Type valueType,
+                                        Type elementType, TypedAttr siteType) {
+  if (!typeName || !isa<StructGeneratorOp>(site.getOperation()))
+    return TypeParamAttr::get(valueType, elementType);
+
+  MLIRContext *ctx = site.getContext();
+  // The decorator generator has to be in hand before a reference can be
+  // rebuilt: without it the parameter count is unknown, and guessing "none"
+  // would rebuild the arity-mismatched `genref` that asserts in mangling.
+  // A miss is therefore the unrecoverable-identity encoding, exactly as a
+  // null `typeName` is -- such a value matches no `*_decorator_of` query.
+  StructGeneratorOp decoratorGen = lookupStructGeneratorFrom(site, typeName);
+  if (!decoratorGen)
+    return TypeParamAttr::get(valueType, elementType);
+
+  SmallVector<TypedAttr> paramValues;
+  ArrayRef<ParamDeclAttr> params = decoratorGen.getInputParams();
+  if (!params.empty()) {
+    // A missing site type is the *unrecoverable identity* encoding here, the
+    // same as a missing generator above -- not a null "not folded yet, retry"
+    // result, which for a condition that never becomes true would spin rather
+    // than diagnose. `packDecorators` answers the identical condition the
+    // identical way (no match), and the two must not disagree: only a
+    // `getFieldTypes`/`getFieldNames` length mismatch can produce it, which
+    // is impossible by construction, so what matters is that neither
+    // interpretation can hang.
+    if (!siteType)
+      return TypeParamAttr::get(valueType, elementType);
+    paramValues.push_back(
+        ParamOperatorAttr::getRebind(siteType, params.front().getType()));
+  }
+  auto genRef =
+      TypeGeneratorRefAttr::get(typeName, paramValues, TypeType::get(ctx));
+  // Run the reference back through the evaluator so it is concretized just as
+  // one written in source is: an elaborator rewrites it to the `instref` that
+  // a caller's own spelling of the decorator type has become by the time the
+  // two are compared, and comparing a `genref` against an `instref` would
+  // decide neither equal nor unequal and leave the comparison unfolded.
+  return evaluator.getReboundAttribute(
+      TypeParamAttr::get(TypeValueType::get(genRef), valueType, elementType));
+}
+
+/// Shared tail for the `*_decorator_types` attributes: rebind each stored
+/// decorator as `packDecorators` does, but yield the *type* of each value
+/// rather than the value, converted to `resultType`'s element metatype.
+static FailureOr<TypedAttr>
+packDecoratorValueTypes(ParameterEvaluationContext &context,
+                        DecoratorSite &site, ParamListType resultType) {
+  Type elementType = resultType.getElementType();
+  FailureOr<TypedAttr> result = failure();
+  context.withEvaluator(
+      site.resolved.decl.getInputParams(), site.resolved.paramValues,
+      [&](ParameterEvaluator &evaluator) {
+        TypedAttr reboundSiteType = site.siteType;
+        if (reboundSiteType && site.siteTypeNeedsRebinding)
+          reboundSiteType = evaluator.getReboundAttribute(reboundSiteType);
+        SmallVector<TypedAttr> resultAttrs;
+        resultAttrs.reserve(site.decorators.size());
+        for (auto [i, decorator] : llvm::enumerate(site.decorators)) {
+          TypedAttr rebound = evaluator.getReboundAttribute(decorator);
+          if (!rebound) {
+            result = TypedAttr();
+            return;
+          }
+          SymbolRefAttr typeName =
+              i < site.typeNames.size() ? site.typeNames[i] : SymbolRefAttr();
+          TypedAttr typeValue = decoratorValueTypeAttr(
+              evaluator, site.resolved.decl, typeName, rebound.getType(),
+              elementType, reboundSiteType);
+          if (!typeValue) {
+            result = TypedAttr();
+            return;
+          }
+          resultAttrs.push_back(typeValue);
+        }
+        result = cast<TypedAttr>(ParamListAttr::get(resultAttrs, resultType));
+      });
+  return result;
+}
+
+FailureOr<TypedAttr> StructDecoratorTypesAttr::evaluateWithContext(
+    ParameterEvaluationContext &context) const {
+  FailureOr<DecoratorSite> site =
+      resolveDecoratorSite(context, "struct_decorator_types", getTypeValue(),
+                           /*fieldIndex=*/TypedAttr());
+  if (failed(site))
+    return failure();
+  if (!site->resolved.decl)
+    return TypedAttr(); // Async: not ready yet.
+  return packDecoratorValueTypes(context, *site, getType());
+}
+
+/// Defense in depth for the "at most one" invariant the singular
+/// `*_decorator_of` attributes promise. `packDecorators` filters by identity
+/// but does not itself cap the result at one entry -- these attributes get
+/// away with a 0-or-1 result only because callers currently guarantee it
+/// from outside this file: the parser's `dedupeDecorators` refuses a second
+/// non-repeatable decorator sharing a base struct, and the stdlib's
+/// `decorator_of[D]()` separately refuses to even ask this question for a
+/// `D` conforming to `RepeatableDecorator` (see `reflect.mojo`). Both of
+/// those are bypassable from here -- a hand-written `__mlir_attr` spelling
+/// can name any decorator type, repeatable or not -- so this is the layer
+/// that actually *owns* the invariant, and it is enforced here too rather
+/// than solely trusted from callers.
+static FailureOr<TypedAttr> requireAtMostOneMatch(
+    ParameterEvaluationContext &context, StringRef attrName,
+    FailureOr<TypedAttr> result) {
+  if (failed(result) || !*result)
+    return result;
+  auto paramList = sugarDynCast<ParamListAttr>(*result);
+  if (paramList && paramList.getValues().size() > 1) {
+    context.emitMaterializationError(
+        Twine(attrName) + " found " +
+        Twine(paramList.getValues().size()) +
+        " matching decorators, but at most one is expected here; a "
+        "decorator conforming to RepeatableDecorator must be queried with "
+        "the plural form instead");
+    return failure();
+  }
+  return result;
+}
+
+FailureOr<TypedAttr> StructDecoratorOfAttr::evaluateWithContext(
+    ParameterEvaluationContext &context) const {
+  // Resolve the site first: it owns the "not a struct type" diagnostic, and
+  // for the field variants the out-of-range index one, which would otherwise
+  // be lost whenever the queried decorator type is also unresolvable.
+  FailureOr<DecoratorSite> site =
+      resolveDecoratorSite(context, "struct_decorator_of", getTypeValue(),
+                           /*fieldIndex=*/TypedAttr());
+  if (failed(site))
+    return failure();
+  if (!site->resolved.decl)
+    return TypedAttr(); // Async: not ready yet.
+
+  DecoratorQuery wanted =
+      decodeDecoratorQuery(context, site->resolved.decl, getDecoratorType());
+  if (!wanted) {
+    context.emitMaterializationError(
+        "struct_decorator_of requires a decorator struct type");
+    return failure();
+  }
+  return requireAtMostOneMatch(
+      context, "struct_decorator_of",
+      packDecorators(context, *site, getType(), wanted));
+}
+
+FailureOr<TypedAttr> StructDecoratorsOfAttr::evaluateWithContext(
+    ParameterEvaluationContext &context) const {
+  // Site first, for the same reason `StructDecoratorOfAttr` does: it owns the
+  // "not a struct type" diagnostic.
+  FailureOr<DecoratorSite> site =
+      resolveDecoratorSite(context, "struct_decorators_of", getTypeValue(),
+                           /*fieldIndex=*/TypedAttr());
+  if (failed(site))
+    return failure();
+  if (!site->resolved.decl)
+    return TypedAttr(); // Async: not ready yet.
+
+  DecoratorQuery wanted =
+      decodeDecoratorQuery(context, site->resolved.decl, getDecoratorType());
+  if (!wanted) {
+    context.emitMaterializationError(
+        "struct_decorators_of requires a decorator struct type");
+    return failure();
+  }
+  // `packDecorators` already collects every matching entry rather than
+  // stopping at the first -- the non-repeatable `*_decorator_of` attributes
+  // get away with 0-or-1 only because the parser guarantees at most one
+  // match exists for them, not because this helper enforces it. So the
+  // plural form needs no changes here, only its own identity (mnemonic and
+  // diagnostic text).
+  return packDecorators(context, *site, getType(), wanted);
+}
+
+FailureOr<TypedAttr> StructFieldDecoratorTypesAttr::evaluateWithContext(
+    ParameterEvaluationContext &context) const {
+  FailureOr<DecoratorSite> site = resolveDecoratorSite(
+      context, "struct_field_decorator_types", getTypeValue(), getFieldIndex());
+  if (failed(site))
+    return failure();
+  if (!site->resolved.decl)
+    return TypedAttr(); // Async: not ready yet.
+  return packDecoratorValueTypes(context, *site, getType());
+}
+
+FailureOr<TypedAttr> StructFieldDecoratorOfAttr::evaluateWithContext(
+    ParameterEvaluationContext &context) const {
+  // Site first, so the out-of-range field index diagnostic is not lost when
+  // the queried decorator type is also unresolvable. See above.
+  FailureOr<DecoratorSite> site = resolveDecoratorSite(
+      context, "struct_field_decorator_of", getTypeValue(), getFieldIndex());
+  if (failed(site))
+    return failure();
+  if (!site->resolved.decl)
+    return TypedAttr(); // Async: not ready yet.
+
+  DecoratorQuery wanted =
+      decodeDecoratorQuery(context, site->resolved.decl, getDecoratorType());
+  if (!wanted) {
+    context.emitMaterializationError(
+        "struct_field_decorator_of requires a decorator struct type");
+    return failure();
+  }
+  // See `requireAtMostOneMatch`: defense in depth for the "at most one"
+  // invariant, enforced here rather than solely trusted from callers.
+  return requireAtMostOneMatch(
+      context, "struct_field_decorator_of",
+      packDecorators(context, *site, getType(), wanted));
+}
+
+FailureOr<TypedAttr> StructFieldDecoratorsOfAttr::evaluateWithContext(
+    ParameterEvaluationContext &context) const {
+  // Site first, so the out-of-range field index diagnostic is not lost when
+  // the queried decorator type is also unresolvable. See above.
+  FailureOr<DecoratorSite> site = resolveDecoratorSite(
+      context, "struct_field_decorators_of", getTypeValue(), getFieldIndex());
+  if (failed(site))
+    return failure();
+  if (!site->resolved.decl)
+    return TypedAttr(); // Async: not ready yet.
+
+  DecoratorQuery wanted =
+      decodeDecoratorQuery(context, site->resolved.decl, getDecoratorType());
+  if (!wanted) {
+    context.emitMaterializationError(
+        "struct_field_decorators_of requires a decorator struct type");
+    return failure();
+  }
+  // See `StructDecoratorsOfAttr::evaluateWithContext`: `packDecorators`
+  // already returns every match, so the plural field form reuses it as-is.
+  return packDecorators(context, *site, getType(), wanted);
+}
+
+//===----------------------------------------------------------------------===//
 // Function Reflection Attrs
 //===----------------------------------------------------------------------===//
 

@@ -1370,6 +1370,54 @@ void StructDeclOp::getFieldTypes(SmallVectorImpl<TypedAttr> &types,
     types.push_back(TypeParamAttr::get(field.getType(), metaType));
 }
 
+void StructDeclOp::getStructDecorators(SmallVectorImpl<TypedAttr> &decorators) {
+  if (DecoratorsAttr attr = getUserDecoratorsAttr())
+    llvm::append_range(decorators, attr.getValue());
+}
+
+void StructDeclOp::getFieldDecorators(size_t index,
+                                      SmallVectorImpl<TypedAttr> &decorators) {
+  for (auto [i, field] : llvm::enumerate(getFieldDecls())) {
+    if (i != index)
+      continue;
+    if (DecoratorsAttr attr = field.getDecoratorsAttr())
+      llvm::append_range(decorators, attr.getValue());
+    return;
+  }
+}
+
+/// Recover the decorator struct that produced `decorator`'s value from the
+/// value's own type. At the LIT level identity is intact: a decorator value
+/// has the `!lit.struct<@serde>` type of the struct it was constructed from,
+/// and a decorator struct may not declare parameters, so that symbol is its
+/// whole identity. (Lowering to KGEN anonymizes the type, which is why
+/// `kgen.struct.generator` has to carry parallel symbol arrays instead.)
+static SymbolRefAttr getDecoratorStructSymbol(TypedAttr decorator) {
+  Type type = decorator.getType();
+  if (auto structType = sugarDynCastIfPresent<LIT::StructType>(type))
+    return structType.getSymbol();
+  return {};
+}
+
+void StructDeclOp::getStructDecoratorTypeNames(
+    SmallVectorImpl<SymbolRefAttr> &names) {
+  if (DecoratorsAttr attr = getUserDecoratorsAttr())
+    for (TypedAttr decorator : attr.getValue())
+      names.push_back(getDecoratorStructSymbol(decorator));
+}
+
+void StructDeclOp::getFieldDecoratorTypeNames(
+    size_t index, SmallVectorImpl<SymbolRefAttr> &names) {
+  for (auto [i, field] : llvm::enumerate(getFieldDecls())) {
+    if (i != index)
+      continue;
+    if (DecoratorsAttr attr = field.getDecoratorsAttr())
+      for (TypedAttr decorator : attr.getValue())
+        names.push_back(getDecoratorStructSymbol(decorator));
+    return;
+  }
+}
+
 /// Verify the debuginfo scope of an op that must be a top-level declaration.
 static LogicalResult verifyTopLevelLocScope(Operation *op) {
   Location loc = op->getLoc();
@@ -1426,7 +1474,7 @@ void StructDeclOp::build(OpBuilder &builder, OperationState &result,
   MLIRContext *ctx = builder.getContext();
   build(builder, result, name, TypeAttr::get(TypeSignatureType::get(ctx)),
         ParamDeclArrayAttr::get(ctx, {}), DecoratorsAttr::get(ctx, {}),
-        TypeAttr::get(TraitType::get(ctx, {})),
+        /*userDecorators=*/{}, TypeAttr::get(TraitType::get(ctx, {})),
         /*isSynthetic=*/{},
         /*nonmaterializableTarget=*/{}, /*moveInit=*/{},
         /*copyInit=*/{}, /*linearTypeErrorMsg*/ {}, /*closureSignature=*/{},
@@ -1469,7 +1517,7 @@ Type StructFieldOp::getReboundType(StructType structSelfType,
 void StructFieldOp::build(OpBuilder &builder, OperationState &odsState,
                           StringAttr name, Type type) {
   build(builder, odsState, name, type, /*docString=*/{}, /*isDocHidden=*/false,
-        /*allowLegacyAnyOrigin=*/false);
+        /*allowLegacyAnyOrigin=*/false, /*decorators=*/{});
 }
 
 void StructFieldOp::build(OpBuilder &builder, OperationState &odsState,

@@ -402,6 +402,23 @@ void LITLowerer::lowerNestedFunction(FnOp func) {
   func.erase();
 }
 
+/// Materialize the decorator-identity symbols reported by
+/// `StructDeclInterface::get{Struct,Field}DecoratorTypeNames` as an
+/// `ArrayAttr`, substituting a `unit` placeholder for entries whose identity
+/// could not be recovered. The struct-instance lowering applied to decorator
+/// values (below) erases which struct produced a fully-foldable (e.g.
+/// fieldless) decorator value down to an anonymous structural type, so these
+/// parallel arrays are the only way to recover decorator identity (e.g. for
+/// `decorator_of[D]()`) once lowered.
+static ArrayAttr materializeDecoratorTypeNames(MLIRContext *ctx,
+                                               ArrayRef<SymbolRefAttr> names) {
+  SmallVector<Attribute> attrs;
+  attrs.reserve(names.size());
+  for (SymbolRefAttr name : names)
+    attrs.push_back(name ? Attribute(name) : Attribute(UnitAttr::get(ctx)));
+  return ArrayAttr::get(ctx, attrs);
+}
+
 LogicalResult
 LITLowerer::lowerStructDecl(StructDeclOp structDecl,
                             Block::iterator mainSymbolTablePosIter) {
@@ -436,8 +453,12 @@ LITLowerer::lowerStructDecl(StructDeclOp structDecl,
         IntegerAttr::get(IndexType::get(structDecl.getContext()), 1);
   info.loc = structDecl.getLoc();
 
-  // Collect the struct fields.
+  // Collect the struct fields, and the user-defined decorator values applied
+  // to each field (compiler decorators are not forwarded).
   SmallVector<StructDefFieldAttr> fieldDecls;
+  SmallVector<Attribute> fieldDecorators;
+  SmallVector<Attribute> fieldDecoratorTypeNames;
+  bool anyFieldDecorated = false;
   for (auto [idx, field] : llvm::enumerate(structDecl.getFieldDecls())) {
     info.fields.emplace_back(field.getNameAttr(), field.getType());
     structDecls.fieldIndices.try_emplace({structName, field.getNameAttr()},
@@ -445,7 +466,24 @@ LITLowerer::lowerStructDecl(StructDeclOp structDecl,
     TypedAttr fieldTypeValue = TypeParamAttr::get(field.getType(), typeType);
     fieldDecls.push_back(
         StructDefFieldAttr::get(field.getNameAttr(), fieldTypeValue));
+
+    DecoratorsAttr decorators = field.getDecoratorsAttr();
+    if (!decorators)
+      decorators = DecoratorsAttr::get(ctx, {});
+    anyFieldDecorated |= !decorators.empty();
+    fieldDecorators.push_back(decorators);
+
+    SmallVector<SymbolRefAttr> thisFieldDecoratorTypeNames;
+    structDecl.getFieldDecoratorTypeNames(idx, thisFieldDecoratorTypeNames);
+    fieldDecoratorTypeNames.push_back(
+        materializeDecoratorTypeNames(ctx, thisFieldDecoratorTypeNames));
   }
+
+  // Struct-level decorator values, plus the parallel identity array.
+  SmallVector<TypedAttr> structDecorators;
+  structDecl.getStructDecorators(structDecorators);
+  SmallVector<SymbolRefAttr> structDecoratorTypeNames;
+  structDecl.getStructDecoratorTypeNames(structDecoratorTypeNames);
 
   // Create struct-generator.
   SmallVector<StringAttr> paramNames;
@@ -461,8 +499,23 @@ LITLowerer::lowerStructDecl(StructDeclOp structDecl,
       structName, paramNames, paramValues, fieldDecls, info.isMemoryOnlyAttr);
 
   OpBuilder b(structDecl->getContext());
+  // NOTE: the trailing optional attributes must be passed explicitly; ODS
+  // drops the C++ default arguments from the generated builder once optional
+  // attributes are appended to the op.
   auto structGen = StructGeneratorOp::create(
-      b, info.loc, structName, info.decls, structInstType, typeType);
+      b, info.loc, structName, info.decls, structInstType, typeType,
+      /*decorators=*/{}, /*decoratorTypeNames=*/{}, /*fieldDecorators=*/{},
+      /*fieldDecoratorTypeNames=*/{});
+  if (!structDecorators.empty()) {
+    structGen.setDecoratorsAttr(DecoratorsAttr::get(ctx, structDecorators));
+    structGen.setDecoratorTypeNamesAttr(
+        materializeDecoratorTypeNames(ctx, structDecoratorTypeNames));
+  }
+  if (anyFieldDecorated) {
+    structGen.setFieldDecoratorsAttr(ArrayAttr::get(ctx, fieldDecorators));
+    structGen.setFieldDecoratorTypeNamesAttr(
+        ArrayAttr::get(ctx, fieldDecoratorTypeNames));
+  }
   Block *structGenBody = b.createBlock(&structGen.getRegion());
 
   for (Operation &member : llvm::make_early_inc_range(

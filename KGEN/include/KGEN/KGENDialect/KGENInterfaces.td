@@ -124,6 +124,42 @@ def StructDeclInterface : OpInterface<"StructDeclInterface"> {
       "Get the input parameter declarations for this struct.",
       "ArrayRef<ParamDeclAttr>", "getInputParams"
     >,
+    InterfaceMethod<[{
+      Get the user-defined decorators applied to the struct declaration
+      (`@serde(...)` where `serde` conforms to `Decorator`). Each entry is the
+      decorator *value* the declaration constructed, in application order --
+      nearest to the declaration first.
+    }], "void", "getStructDecorators",
+      (ins "SmallVectorImpl<TypedAttr> &":$decorators)
+    >,
+    InterfaceMethod<[{
+      Get the user-defined decorator values applied to the field at `index`.
+      Appends nothing for an undecorated or out-of-range field.
+    }], "void", "getFieldDecorators",
+      (ins "size_t":$index, "SmallVectorImpl<TypedAttr> &":$decorators)
+    >,
+    InterfaceMethod<[{
+      Get the identity of the decorator struct that produced each entry of
+      `getStructDecorators`, appended in the same order and with the same
+      count. Each entry is a symbol reference to the decorator struct, or a
+      null `SymbolRefAttr` when identity is unrecoverable.
+
+      This exists because a decorator is stored as a *value*, and lowering
+      anonymizes the value's type: a fieldless decorator becomes
+      `#kgen.struct<> : !kgen.struct<() memoryOnly>`, which is byte-identical
+      for two different decorator structs. Consumers that need to know *which*
+      decorator struct a stored value came from must use this rather than the
+      value's own type.
+    }], "void", "getStructDecoratorTypeNames",
+      (ins "SmallVectorImpl<SymbolRefAttr> &":$names)
+    >,
+    InterfaceMethod<[{
+      Get the identity of the decorator struct that produced each entry of
+      `getFieldDecorators(index, ...)`, appended in the same order and with
+      the same count. See `getStructDecoratorTypeNames`.
+    }], "void", "getFieldDecoratorTypeNames",
+      (ins "size_t":$index, "SmallVectorImpl<SymbolRefAttr> &":$names)
+    >,
     InterfaceMethod< [{
       Lookup a conformance by trait symbol, when returning non-null, the type
       of the returned Operation must be a ConformanceOp, we declare it as

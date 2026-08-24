@@ -509,6 +509,43 @@ def StructFieldNamesAttr : DialectAttribute<(attr
   ConcreteType<"ParamListType">:$type
 )>;
 
+def StructDecoratorTypesAttr : DialectAttribute<(attr
+  TypedAttr:$typeValue,
+  ConcreteType<"ParamListType">:$type
+)>;
+
+def StructFieldDecoratorTypesAttr : DialectAttribute<(attr
+  TypedAttr:$typeValue,
+  TypedAttr:$fieldIndex,
+  ConcreteType<"ParamListType">:$type
+)>;
+
+def StructDecoratorOfAttr : DialectAttribute<(attr
+  TypedAttr:$typeValue,
+  TypedAttr:$decoratorType,
+  ConcreteType<"ParamListType">:$type
+)>;
+
+def StructDecoratorsOfAttr : DialectAttribute<(attr
+  TypedAttr:$typeValue,
+  TypedAttr:$decoratorType,
+  ConcreteType<"ParamListType">:$type
+)>;
+
+def StructFieldDecoratorOfAttr : DialectAttribute<(attr
+  TypedAttr:$typeValue,
+  TypedAttr:$fieldIndex,
+  TypedAttr:$decoratorType,
+  ConcreteType<"ParamListType">:$type
+)>;
+
+def StructFieldDecoratorsOfAttr : DialectAttribute<(attr
+  TypedAttr:$typeValue,
+  TypedAttr:$fieldIndex,
+  TypedAttr:$decoratorType,
+  ConcreteType<"ParamListType">:$type
+)>;
+
 def StructFieldIndexByNameAttr : DialectAttribute<(attr
   TypedAttr:$typeValue,
   TypedAttr:$fieldName,
@@ -643,6 +680,8 @@ def KGENDialectAttributes : DialectAttributes<"kgen"> {
     GetTypeNameAttr,
     StructFieldTypesAttr,
     StructFieldNamesAttr,
+    StructDecoratorTypesAttr,
+    StructFieldDecoratorTypesAttr,
     StructFieldIndexByNameAttr,
     StructFieldTypeByNameAttr,
     StructFieldOffsetByIndexAttr,
@@ -664,7 +703,13 @@ def KGENDialectAttributes : DialectAttributes<"kgen"> {
     SingletonAttr,
     FnMetadataAttr,
     TraitSymbolAttr,
-    TraitSymbolArrayAttr
+    TraitSymbolArrayAttr,
+    FnGenBuilderParamDeclAttr,
+    FnGenBuilderParamDeclRefAttr,
+    StructDecoratorOfAttr,
+    StructFieldDecoratorOfAttr,
+    StructDecoratorsOfAttr,
+    StructFieldDecoratorsOfAttr
   ];
 }
 

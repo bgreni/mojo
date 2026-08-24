@@ -560,3 +560,44 @@ kgen.generator @bind_params_discharged_mask_size() {
                             #kgen.type<i64> : !kgen.type,
                             #kgen<simd 1> : !kgen.scalar<index>>
 } : () -> ()
+
+// -----
+
+// COM: Decorator identity is carried in arrays parallel to the decorators and
+// COM: to the fields, because the struct-instance lowering anonymizes a
+// COM: decorator value's own type. A desynchronized array is indistinguishable
+// COM: downstream from "no decorator", so it is rejected here.
+
+// expected-error @+1 {{'decorators' and 'decoratorTypeNames' must be present together}}
+kgen.struct.generator @missing_names = struct_inst<"missing_names"(x: #kgen.type<i32> : !kgen.type) memoryOnly>{
+} attributes {decorators = #kgen<decorators[#kgen.struct<> : !kgen.struct<() memoryOnly>]>}
+
+// -----
+
+// expected-error @+1 {{'decorators' and 'decoratorTypeNames' must be present together}}
+kgen.struct.generator @missing_decorators = struct_inst<"missing_decorators"(x: #kgen.type<i32> : !kgen.type) memoryOnly>{
+} attributes {decoratorTypeNames = [@tag]}
+
+// -----
+
+// expected-error @+1 {{'decoratorTypeNames' has 2 entries but there are 1 decorators; the arrays must be parallel}}
+kgen.struct.generator @name_count_mismatch = struct_inst<"name_count_mismatch"(x: #kgen.type<i32> : !kgen.type) memoryOnly>{
+} attributes {decoratorTypeNames = [@tag, @other], decorators = #kgen<decorators[#kgen.struct<> : !kgen.struct<() memoryOnly>]>}
+
+// -----
+
+// expected-error @+1 {{'decoratorTypeNames' entries must be a symbol reference naming the decorator struct, or `unit` where the identity is unknown}}
+kgen.struct.generator @bad_name_entry = struct_inst<"bad_name_entry"(x: #kgen.type<i32> : !kgen.type) memoryOnly>{
+} attributes {decoratorTypeNames = [3 : i64], decorators = #kgen<decorators[#kgen.struct<> : !kgen.struct<() memoryOnly>]>}
+
+// -----
+
+// expected-error @+1 {{must both have one entry per field, and the struct has 2}}
+kgen.struct.generator @field_count_mismatch = struct_inst<"field_count_mismatch"(x: #kgen.type<i32> : !kgen.type, y: #kgen.type<i32> : !kgen.type) memoryOnly>{
+} attributes {fieldDecorators = [#kgen<decorators[]>], fieldDecoratorTypeNames = [[]]}
+
+// -----
+
+// expected-error @+1 {{'fieldDecoratorTypeNames' entry 0 has 0 entries but there are 1 decorators; the arrays must be parallel}}
+kgen.struct.generator @field_name_count_mismatch = struct_inst<"field_name_count_mismatch"(x: #kgen.type<i32> : !kgen.type) memoryOnly>{
+} attributes {fieldDecorators = [#kgen<decorators[#kgen.struct<> : !kgen.struct<() memoryOnly>]>], fieldDecoratorTypeNames = [[]]}

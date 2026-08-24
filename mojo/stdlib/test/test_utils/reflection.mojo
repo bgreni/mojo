@@ -12,6 +12,8 @@
 # ===----------------------------------------------------------------------=== #
 """Provides test types for validating reflection-based trait implementations."""
 
+from std.reflection import Decorator
+
 
 @fieldwise_init
 struct SimplePoint(Equatable, Hashable, ImplicitlyCopyable, Writable):
@@ -50,3 +52,21 @@ struct EmptyStruct(Equatable, Hashable, ImplicitlyCopyable, Writable):
     # Uses default reflection-based write_to from Writable trait
     # Uses default reflection-based __eq__ from Equatable trait
     # Uses default reflection-based __hash__ from Hashable trait
+
+
+@fieldwise_init
+struct FixtureTag(Decorator):
+    pass
+
+
+@fieldwise_init
+struct FixtureName(Decorator):
+    var wire: StaticString
+
+
+@FixtureTag
+@FixtureName("wire_a")
+struct DecoratedFixture:
+    @FixtureName("field_a")
+    var a: Int
+    var b: Int

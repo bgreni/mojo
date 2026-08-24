@@ -734,6 +734,133 @@ void StructGeneratorOp::getFieldTypes(SmallVectorImpl<TypedAttr> &types,
   }
 }
 
+void StructGeneratorOp::getStructDecorators(
+    SmallVectorImpl<TypedAttr> &decorators) {
+  if (DecoratorsAttr attr = getDecoratorsAttr())
+    llvm::append_range(decorators, attr.getValue());
+}
+
+void StructGeneratorOp::getFieldDecorators(
+    size_t index, SmallVectorImpl<TypedAttr> &decorators) {
+  ArrayAttr fieldDecorators = getFieldDecoratorsAttr();
+  if (!fieldDecorators || index >= fieldDecorators.size())
+    return;
+  if (auto attr = dyn_cast<DecoratorsAttr>(fieldDecorators[index]))
+    llvm::append_range(decorators, attr.getValue());
+}
+
+/// Append `count` entries from the parallel type-name array `typeNames`,
+/// substituting a null symbol wherever the name is missing or is the `unit`
+/// placeholder recorded for a decorator whose identity could not be captured.
+static void appendDecoratorTypeNames(ArrayAttr typeNames, size_t count,
+                                     SmallVectorImpl<SymbolRefAttr> &names) {
+  for (size_t i = 0; i != count; ++i)
+    names.push_back(typeNames && i < typeNames.size()
+                        ? dyn_cast<SymbolRefAttr>(typeNames[i])
+                        : SymbolRefAttr());
+}
+
+void StructGeneratorOp::getStructDecoratorTypeNames(
+    SmallVectorImpl<SymbolRefAttr> &names) {
+  DecoratorsAttr decorators = getDecoratorsAttr();
+  if (!decorators)
+    return;
+  appendDecoratorTypeNames(getDecoratorTypeNamesAttr(),
+                           decorators.getValue().size(), names);
+}
+
+void StructGeneratorOp::getFieldDecoratorTypeNames(
+    size_t index, SmallVectorImpl<SymbolRefAttr> &names) {
+  ArrayAttr fieldDecorators = getFieldDecoratorsAttr();
+  if (!fieldDecorators || index >= fieldDecorators.size())
+    return;
+  auto decorators = dyn_cast<DecoratorsAttr>(fieldDecorators[index]);
+  if (!decorators)
+    return;
+
+  ArrayAttr typeNames;
+  if (ArrayAttr allTypeNames = getFieldDecoratorTypeNamesAttr())
+    if (index < allTypeNames.size())
+      typeNames = dyn_cast<ArrayAttr>(allTypeNames[index]);
+  appendDecoratorTypeNames(typeNames, decorators.getValue().size(), names);
+}
+
+/// Verify one decorator-identity array: it must be parallel to a decorator
+/// list of `count` entries and hold only symbol references (or the `unit`
+/// placeholder LowerLIT writes where identity could not be recovered).
+static LogicalResult verifyDecoratorTypeNames(Operation *op,
+                                              ArrayAttr typeNames, size_t count,
+                                              const Twine &what) {
+  if (typeNames.size() != count)
+    return op->emitOpError()
+           << what << " has " << typeNames.size() << " entries but there are "
+           << count << " decorators; the arrays must be parallel";
+  for (Attribute name : typeNames)
+    if (!isa<SymbolRefAttr, UnitAttr>(name))
+      return op->emitOpError()
+             << what
+             << " entries must be a symbol reference naming the decorator "
+                "struct, or `unit` where the identity is unknown";
+  return success();
+}
+
+/// Decorator identity does not survive in the values themselves -- the
+/// struct-instance lowering anonymizes a decorator value's type -- so it is
+/// carried in arrays that run parallel to the decorators and to the fields.
+/// Nothing downstream can tell a desynchronized array from a decorator that
+/// simply is not there, so the invariant is checked here rather than
+/// degrading silently into "no decorator found".
+LogicalResult StructGeneratorOp::verify() {
+  DecoratorsAttr decorators = getDecoratorsAttr();
+  ArrayAttr decoratorTypeNames = getDecoratorTypeNamesAttr();
+  if (static_cast<bool>(decorators) != static_cast<bool>(decoratorTypeNames))
+    return emitOpError("'decorators' and 'decoratorTypeNames' must be present "
+                       "together");
+  if (decorators &&
+      failed(verifyDecoratorTypeNames(getOperation(), decoratorTypeNames,
+                                      decorators.getValue().size(),
+                                      "'decoratorTypeNames'")))
+    return failure();
+
+  ArrayAttr fieldDecorators = getFieldDecoratorsAttr();
+  ArrayAttr fieldDecoratorTypeNames = getFieldDecoratorTypeNamesAttr();
+  if (static_cast<bool>(fieldDecorators) !=
+      static_cast<bool>(fieldDecoratorTypeNames))
+    return emitOpError("'fieldDecorators' and 'fieldDecoratorTypeNames' must "
+                       "be present together");
+  if (!fieldDecorators)
+    return success();
+
+  auto structType = dyn_cast<StructInstanceType>(getValueDomainType());
+  if (!structType)
+    return emitOpError(
+        "'fieldDecorators' requires a struct instance value domain type");
+  size_t numFields = structType.getFields().size();
+  if (fieldDecorators.size() != numFields ||
+      fieldDecoratorTypeNames.size() != numFields)
+    return emitOpError()
+           << "'fieldDecorators' (" << fieldDecorators.size() << ") and "
+           << "'fieldDecoratorTypeNames' (" << fieldDecoratorTypeNames.size()
+           << ") must both have one entry per field, and the struct has "
+           << numFields;
+
+  for (auto [i, entry] : llvm::enumerate(fieldDecorators)) {
+    auto perField = dyn_cast<DecoratorsAttr>(entry);
+    if (!perField)
+      return emitOpError() << "'fieldDecorators' entry " << i
+                           << " must be a '#kgen.decorators'";
+    auto perFieldNames = dyn_cast<ArrayAttr>(fieldDecoratorTypeNames[i]);
+    if (!perFieldNames)
+      return emitOpError() << "'fieldDecoratorTypeNames' entry " << i
+                           << " must be an array";
+    if (failed(verifyDecoratorTypeNames(
+            getOperation(), perFieldNames, perField.getValue().size(),
+            "'fieldDecoratorTypeNames' entry " + Twine(i))))
+      return failure();
+  }
+  return success();
+}
+
 //===----------------------------------------------------------------------===//
 // StructInstanceOp
 //===----------------------------------------------------------------------===//

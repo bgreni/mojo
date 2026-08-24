@@ -1014,6 +1014,42 @@ bool StructFieldTypesAttr::isConstant() const { return false; }
 bool StructFieldNamesAttr::isConstant() const { return false; }
 
 //===----------------------------------------------------------------------===//
+// StructDecoratorTypesAttr
+//===----------------------------------------------------------------------===//
+
+bool StructDecoratorTypesAttr::isConstant() const { return false; }
+
+//===----------------------------------------------------------------------===//
+// StructDecoratorOfAttr
+//===----------------------------------------------------------------------===//
+
+bool StructDecoratorOfAttr::isConstant() const { return false; }
+
+//===----------------------------------------------------------------------===//
+// StructDecoratorsOfAttr
+//===----------------------------------------------------------------------===//
+
+bool StructDecoratorsOfAttr::isConstant() const { return false; }
+
+//===----------------------------------------------------------------------===//
+// StructFieldDecoratorTypesAttr
+//===----------------------------------------------------------------------===//
+
+bool StructFieldDecoratorTypesAttr::isConstant() const { return false; }
+
+//===----------------------------------------------------------------------===//
+// StructFieldDecoratorOfAttr
+//===----------------------------------------------------------------------===//
+
+bool StructFieldDecoratorOfAttr::isConstant() const { return false; }
+
+//===----------------------------------------------------------------------===//
+// StructFieldDecoratorsOfAttr
+//===----------------------------------------------------------------------===//
+
+bool StructFieldDecoratorsOfAttr::isConstant() const { return false; }
+
+//===----------------------------------------------------------------------===//
 // StructFieldIndexByNameAttr
 //===----------------------------------------------------------------------===//
 

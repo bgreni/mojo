@@ -355,7 +355,27 @@ def KGEN_StructGeneratorOp : KGENOp<"struct.generator", [Symbol, SymbolTable, De
   let arguments = (ins SymbolNameAttr:$sym_name,
                        KGEN_ParamDeclArrayAttr:$inputParams,
                        TypeAttr:$valueDomainType,
-                       TypeAttr:$metaType);
+                       TypeAttr:$metaType,
+                       // User-defined decorator values applied to the
+                       // struct declaration, forwarded from
+                       // `lit.struct.decl`, nearest to the declaration first.
+                       OptionalAttr<KGEN_DecoratorsAttr>:$decorators,
+                       // Symbol reference to the originating decorator struct
+                       // for each entry in `decorators`, in the same order.
+                       // The generic struct-instance lowering that produces
+                       // `decorators`' values erases which struct produced a
+                       // fully-foldable (e.g. fieldless) decorator value down
+                       // to an anonymous structural type, so this parallel
+                       // array is the only way to recover decorator identity
+                       // (e.g. for `decorator_of[D]()`) once lowered.
+                       OptionalAttr<ArrayAttr>:$decoratorTypeNames,
+                       // Per-field decorator values, parallel to the fields
+                       // of `valueDomainType`; each entry is a
+                       // `#kgen.decorators`.
+                       OptionalAttr<ArrayAttr>:$fieldDecorators,
+                       // Per-field parallel arrays of symbol references, mirroring
+                       // `decoratorTypeNames` but for each field's decorator list.
+                       OptionalAttr<ArrayAttr>:$fieldDecoratorTypeNames);
   let regions = (region SizedRegion<1>:$body);
 
   let assemblyFormat = [{
@@ -364,6 +384,9 @@ def KGEN_StructGeneratorOp : KGENOp<"struct.generator", [Symbol, SymbolTable, De
       $inputParams, $valueDomainType, $metaType, $body)
     attr-dict-with-keyword
   }];
+
+  // Checks that the decorator arrays above stay parallel to what they index.
+  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//

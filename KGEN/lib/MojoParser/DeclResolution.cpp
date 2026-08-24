@@ -42,6 +42,7 @@
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/Transforms/RegionUtils.h"
 #include "llvm/ADT/ScopeExit.h"
+#include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/Regex.h"
@@ -102,6 +103,19 @@ static LogicalResult resolveDefaultedOpFromTrait(DeclResolver &resolver,
 //===----------------------------------------------------------------------===//
 
 namespace {
+/// A successfully emitted user decorator: the stored value plus the struct
+/// declaration it was constructed from, which is the identity the
+/// no-duplicates rule is enforced on.
+struct EmittedDecorator {
+  TypedAttr value;
+  StructDeclOp baseStruct;
+  /// Whether `baseStruct` conforms to `RepeatableDecorator`, in which case
+  /// the no-duplicates rule does not apply to it. Computed once, alongside
+  /// the `Decorator` conformance check, from the same emitted value's type --
+  /// see `tryEmitDecoratorValue`.
+  bool isRepeatable = false;
+};
+
 /// Decorators attached to a declaration may be "signature" decorators or "body"
 /// decorators.
 ///
@@ -437,8 +451,10 @@ LogicalResult Decorators::handleStable(ExprNode *expr, ASTDecl &decl) {
 
 LogicalResult Decorators::handleDocHidden(ExprNode *expr, ASTDecl &decl) {
   // Only handle bare `@doc_hidden` (no arguments) on declaration types that
-  // cannot use the full decorator resolution machinery (IREmitter) without
-  // causing recursive scope lookup issues: AliasDeclOp and StructFieldOp.
+  // cannot run the IREmitter with their own decl as the scope, because that
+  // would recursively re-resolve the decl being defined: AliasDeclOp and
+  // StructFieldOp. (Decorator types on fields are instead emitted in the
+  // parent struct's scope, see `resolveSignature(StructFieldOp)`.)
   // For FnOp, StructDeclOp, etc., @doc_hidden is deferred to body processing.
   auto declRef = dyn_cast<DeclRefNode>(expr);
   if (!declRef || declRef->spelling != "doc_hidden")
@@ -531,6 +547,376 @@ static std::optional<StringRef> extractDecoratorName(TypedAttr attr) {
   return std::nullopt;
 }
 
+/// Emit the "decorator structs may declare at most one parameter" rejection.
+///
+/// A decorator is identified by its struct, and that identity has to survive
+/// lowering, which anonymizes the value's type: only a symbol naming the
+/// struct is carried through. A symbol cannot distinguish one parameter
+/// binding from another, so identity would be lost --
+/// `decorator_of[serde[Int]]` and `decorator_of[serde[String]]` would both
+/// match a single stored `@serde[...]` once lowered.
+///
+/// One parameter is nevertheless allowed, because the compiler, not the user,
+/// chooses its binding: it is always the type of the declaration the decorator
+/// is attached to (the field's type for a field decorator, the struct's own
+/// type for a struct decorator). Base-struct symbol plus the site therefore
+/// still reconstructs the parameterization exactly, so symbol identity stays
+/// total. A *second* parameter has no such site-derived value to bind, which
+/// is where the line is drawn.
+static FailureOr<std::optional<EmittedDecorator>>
+emitDecoratorParametersError(SharedState &shared, ExprNode *decorator,
+                             StringRef name) {
+  shared.emitError(decorator->getLoc(), "decorator struct '")
+      << name
+      << "' may declare at most one parameter; the one parameter is bound to "
+         "the decorated declaration's type, so carry any other payload in "
+         "fields instead (a type payload can be passed as a function value)"
+      << decorator->getRange();
+  return failure();
+}
+
+/// Emit the rejection for an explicit parameter list at the *use* site
+/// (`@serde[Int]`). The single parameter a decorator may declare is bound by
+/// the compiler to the decorated declaration's type; letting the user override
+/// that would reintroduce exactly the type instability site-derivation exists
+/// to avoid -- `@serde[Int]` and `@serde` on the same field would be different
+/// types, and a reader querying one spelling would silently miss the other.
+static FailureOr<std::optional<EmittedDecorator>>
+emitDecoratorExplicitParametersError(SharedState &shared, ExprNode *decorator,
+                                     StringRef name) {
+  shared.emitError(decorator->getLoc(), "decorator struct '")
+      << name
+      << "' does not accept an explicit parameter list; its parameter is "
+         "bound to the decorated declaration's type"
+      << decorator->getRange();
+  return failure();
+}
+
+/// Whether `structDecl` provably declares conformance to the `Decorator`
+/// marker trait, answered from the declaration alone.
+///
+/// The main path below tests conformance on the *emitted value's* type, which
+/// is the more precise question but is unanswerable for a struct that declares
+/// an undefaulted parameter, since no such value can be constructed.
+///
+/// This is deliberately **one-sided and conservative**: with no parameter
+/// bindings to evaluate against, a *conditional* conformance
+/// (`struct d[N: Int](Decorator where N > 0)`) resolves to `unknown` and this
+/// returns false. So a false answer means only "not provable here", never "not
+/// a decorator" -- which is why the caller uses it solely to choose the better
+/// of two diagnostics, and why the parameter rejection is repeated
+/// unconditionally after emission, where the bindings exist and conformance
+/// can be settled.
+static bool declaresDecoratorConformance(ASTDecl &structDecl, SMLoc loc) {
+  SharedState &shared = structDecl.getShared();
+  TraitType decoratorTrait = shared.lookupBuiltinTraitType("Decorator", loc);
+  if (!decoratorTrait)
+    return false;
+  return structDecl
+      .doesNominalTypeConformTo(decoratorTrait, /*concreteType=*/ASTType(),
+                                /*callerAssumptions=*/{})
+      .isTrue();
+}
+
+/// Try to emit `decorator` as a *decorator value*: `@name` or `@name(args)`,
+/// where `name` resolves to a struct conforming to the `Decorator` marker
+/// trait. Parenthesized operands are constructor arguments; the bare form
+/// gains an empty argument list, so both forms reduce to a constructor call
+/// whose value is stored on the declaration.
+///
+/// A decorator struct may declare exactly one parameter. It is never inferred
+/// from the constructor arguments and never spelled at the use site: the
+/// compiler binds it to `siteType`, the type of the declaration the decorator
+/// is attached to. That is what makes `@serde(rename="n")` and
+/// `@serde(skip_if=f)` on the same `var name: String` both `serde[String]`
+/// rather than two unrelated types one query would silently miss. A bracketed
+/// form (`@name[params]`) is still recognized here, but only so that it
+/// reaches the explicit-parameter rejection below rather than a confusing
+/// parameter-binding failure.
+///
+/// Only a plain identifier is a candidate: a dotted name (`@pkg.serde(...)`)
+/// is not supported, import the name instead.
+///
+/// `siteType` is the field's type at the field-decorator call site and the
+/// struct's own `Self` type at the struct-decorator call site.
+///
+/// Returns `std::nullopt` when `decorator` does not name a struct declaration
+/// (the caller continues with its existing handling), `failure()` when an error
+/// was diagnosed, and the emitted value along with its base struct on success.
+static FailureOr<std::optional<EmittedDecorator>>
+tryEmitDecoratorValue(ExprNode *decorator, ASTDecl &scope, ASTType siteType) {
+  SharedState &shared = scope.getShared();
+  // NOTE: `FailureOr<T>` derives from `std::optional<T>`, so a bare
+  // `return std::nullopt;` would not compile here.
+  const std::optional<EmittedDecorator> notADecorator;
+
+  // Peel `@name` and `@name(...)` -- plus the rejected bracket spellings
+  // `@name[...]` and `@name[...](...)` -- down to the identifier. Parens are
+  // outermost when both are present.
+  const ExprNode *callee = decorator;
+  auto *call = dyn_cast<CallNode>(decorator);
+  if (call)
+    callee = call->callee;
+  bool hasExplicitParams = false;
+  if (auto *subscript = dyn_cast<SubscriptNode>(callee)) {
+    callee = subscript->base;
+    hasExplicitParams = true;
+  }
+  auto *declRef = dyn_cast<DeclRefNode>(callee);
+  if (!declRef)
+    return notADecorator;
+
+  // Classify by name lookup alone, without emitting anything: only a name that
+  // resolves to a struct declaration is a decorator. Everything else
+  // (functions, overload sets, unknown names, compiler-only spellings) keeps
+  // its existing handling and diagnostics on the caller's path.
+  LookupResult lookup =
+      shared.lookupAndResolveDecl(declRef->spelling, declRef->getLoc(), scope,
+                                  /*searchParentScopes=*/true);
+  if (lookup.isErroneous())
+    return failure();
+  StructDeclOp baseStruct;
+  ASTDecl *baseStructDecl = nullptr;
+  for (ASTDecl *found : lookup.getIfSuccess())
+    if (auto s = dyn_cast_or_null<StructDeclOp>(found->getIfOperation())) {
+      baseStruct = s;
+      baseStructDecl = found;
+      break;
+    }
+  if (!baseStruct)
+    return notADecorator;
+
+  // GUARD "preEmissionParameterRejection": decorator structs may declare at
+  // most one parameter (see `emitDecoratorParametersError` for why one is
+  // allowed and two are not). The rule is enforced twice, by two distinctly
+  // named guards, and both halves are load-bearing -- a previous round
+  // reopened a hole by treating one as redundant with the other.
+  //
+  // This is the *pre-emission* half: a decorator struct with two or more
+  // parameters, at least one of them *undefaulted*, cannot be emitted at all
+  // -- `@serde` would fail parameter inference first and report
+  // `'serde[_]' is not concrete` instead of anything actionable. (One
+  // undefaulted parameter is fine, because the binding below supplies it.)
+  // Reaching it needs conformance answered from the declaration, which
+  // `declaresDecoratorConformance` can only do one-sidedly, so this half is
+  // gated on a *provable* conformance: that keeps a parameterized struct
+  // which is not a decorator at all on its own diagnostics rather than
+  // telling it it is a malformed decorator.
+  //
+  // The other half is guard "postEmissionParameterRejection", after
+  // emission (below), unconditional on the parameter list. A conditional
+  // conformance (`struct d[A: AnyType = NoneType, N: Int = 1](Decorator
+  // where N > 0)`) is unprovable without bindings, so it slips past this
+  // half and is caught by that one, where the emitted value supplies the
+  // bindings.
+  //
+  // If you are about to delete this guard as duplicate-looking code, don't
+  // -- see "postEmissionParameterRejection" below for why it alone is not
+  // enough (`struct_decorator_types_errors.mojo`'s `UsesConditional` /
+  // `ConditionalField` pin exactly this).
+  if (baseStruct.getParams().size() > 1 &&
+      declaresDecoratorConformance(*baseStructDecl, decorator->getLoc()))
+    return emitDecoratorParametersError(shared, decorator, declRef->spelling);
+
+  // The single parameter a decorator may declare is *site-derived*: bind it
+  // here, before emission, to the type of the declaration being decorated.
+  // The binding never depends on which constructor arguments were written,
+  // which is the property the whole design exists for -- see the function
+  // comment.
+  //
+  // This synthesizes `name[siteType]` as the callee, in the same way the
+  // bare form synthesizes an empty argument list below: both spellings then
+  // reduce to one constructor call on a fully-bound generator.
+  //
+  // It is skipped when the use site wrote its own brackets. That spelling is
+  // rejected -- see "explicitParameterRejection" below -- but only *after*
+  // emission settles whether this is a decorator at all, so that a
+  // parameterized struct which is not one keeps its own
+  // `'X' is not a decorator` diagnostic. Rewriting the callee out from under
+  // it here would emit a value the user never wrote and hide that.
+  const ExprNode *boundCallee = declRef;
+  if (baseStruct.getParams().size() == 1 && !hasExplicitParams) {
+    if (!siteType) {
+      shared.emitError(decorator->getLoc(),
+                       "cannot determine the type of the decorated "
+                       "declaration to bind decorator struct '")
+          << declRef->spelling << "' parameter to" << decorator->getRange();
+      return failure();
+    }
+    SMLoc loc = decorator->getLoc();
+    auto *siteTypeNode =
+        shared.allocPersistent<SyntheticNode>(loc, PValue(siteType));
+    Operand siteTypeOperand(siteTypeNode, loc, ArgUnpackStyle::kPositional);
+    boundCallee = shared.allocPersistent<SubscriptNode>(
+        declRef, loc,
+        shared.getPersistentCopy(ArrayRef<Operand>(siteTypeOperand)), loc);
+  }
+
+  // Normalize to a call: `@tag` gains an empty argument list, while
+  // `@serde(rename="x")` already is one. When the parameter was bound above
+  // the call has to be rebuilt around the bound callee, keeping whatever
+  // constructor arguments were written.
+  const ExprNode *valueExpr = decorator;
+  if (boundCallee != declRef) {
+    SMLoc end = decorator->getRangeEnd();
+    valueExpr = shared.allocPersistent<CallNode>(
+        boundCallee, call ? call->lparenLoc : end,
+        call ? call->operands : ArrayRef<Operand>{}, end);
+  } else if (!call) {
+    SMLoc end = decorator->getRangeEnd();
+    valueExpr = shared.allocPersistent<CallNode>(decorator, end,
+                                                 ArrayRef<Operand>{}, end);
+  }
+
+  IREmitter emitter(scope, EC_Decorator);
+  PValue decoratorValue = emitter.emitExprPValue(valueExpr, EC_Decorator);
+  if (!decoratorValue)
+    return failure(); // Already diagnosed (bad keyword, missing arg, ...).
+
+  auto assumptions = ASTDecl::getAssumptionsFromScope(&scope);
+  ASTType decoratorType(decoratorValue.getType());
+  if (!decoratorType.provenConformsToBuiltinTrait(
+          "Decorator", decorator->getLoc(), shared, assumptions)) {
+    shared.emitError(decorator->getLoc(), "'")
+        << declRef->spelling
+        << "' is not a decorator; decorator structs must conform to "
+           "'Decorator'"
+        << decorator->getRange();
+    return failure();
+  }
+
+  // GUARD "postEmissionParameterRejection": the other half of the
+  // parameter rule -- see "preEmissionParameterRejection" above.
+  // Unconditional on how conformance was declared, because by here
+  // conformance is settled: anything that reaches this point is a decorator,
+  // so a second parameter is a rejection no matter how the conformance was
+  // declared. This is what catches a *conditional* `Decorator` conformance,
+  // which "preEmissionParameterRejection" cannot prove from the declaration
+  // alone.
+  //
+  // If you are about to delete this guard as duplicate-looking code, don't
+  // -- see "preEmissionParameterRejection" above for why it alone is not
+  // enough (it would let a two-parameter decorator with an undefaulted
+  // parameter through with a confusing "not concrete" diagnostic instead of
+  // this one's actionable message).
+  if (baseStruct.getParams().size() > 1)
+    return emitDecoratorParametersError(shared, decorator, declRef->spelling);
+
+  // GUARD "explicitParameterRejection": an explicit parameter list at the use
+  // site (`@serde[Int]`) would override the site-derived binding and
+  // reintroduce exactly the type instability that binding exists to avoid.
+  //
+  // Why one guard here is *safe*, unlike the parameter-count rule two guards
+  // up: this one runs after `provenConformsToBuiltinTrait` answered
+  // conformance on the **emitted value's type**, with the bindings in hand.
+  // That is the precise question, not `declaresDecoratorConformance`'s
+  // one-sided approximation -- which is what reopened the hole last time. So
+  // a *conditional* `Decorator` conformance cannot slip past: `@cond_one[N=2]`
+  // is rejected here, and `@cond_one[N=0]`, which is not a decorator under
+  // that binding, correctly gets `'cond_one' is not a decorator` above rather
+  // than this message.
+  //
+  // Why it is *not* a superset of the pre-emission twin it replaced, which is
+  // the cost of choosing one guard: three bracket spellings exit at emission
+  // and never reach here, so they now get a raw binder diagnostic where the
+  // twin would have said something actionable.
+  //
+  //   @zero_param[Int]         -> "unexpected parameter"  (no guard ever
+  //                               covered this one: arity 0, nothing to bind)
+  //   @one_param[Int, String]  -> "unexpected parameter"
+  //   @one_param[3]            -> "'one_param' parameter 'FieldT' has
+  //                               'AnyType' type, but value has type
+  //                               'IntLiteral[3]'"
+  //
+  // Deliberate: correctness is unaffected -- every one of those is still
+  // rejected -- and a third guard in this function was judged worse than a
+  // worse message on spellings nobody writes. Note the tension honestly: the
+  // parameter-count rule two guards up keeps a duplicated pair for exactly
+  // the reason this one gives up. If those diagnostics start mattering,
+  // restoring a pre-emission twin gated on `declaresDecoratorConformance`
+  // (as "preEmissionParameterRejection" is) is the fix -- and it must be an
+  // *addition*, never a replacement for this one, which is the half that
+  // closes the conditional-conformance hole.
+  if (hasExplicitParams)
+    return emitDecoratorExplicitParametersError(shared, decorator,
+                                                declRef->spelling);
+
+  // A decorator opts out of the no-duplicates rule (see `dedupeDecorators`)
+  // by conforming to `RepeatableDecorator`. Reuse the same value-type-based
+  // conformance check just used for `Decorator` above, rather than the
+  // declaration-level `declaresDecoratorConformance` route: the emitted
+  // value's type is already in hand here, so the precise question can be
+  // answered directly instead of the one-sided "provable from the
+  // declaration alone" approximation that route exists for.
+  bool isRepeatable = decoratorType.provenConformsToBuiltinTrait(
+      "RepeatableDecorator", decorator->getLoc(), shared, assumptions);
+
+  return std::optional<EmittedDecorator>(
+      EmittedDecorator{decoratorValue.get(), baseStruct, isRepeatable});
+}
+
+/// Diagnose decorators that share a base struct with another on the same
+/// declaration, and return the values of the ones that survive.
+///
+/// `decorators` and `nodes` are parallel and arrive in *application* order --
+/// nearest to the declaration first, which is the reverse of the order they
+/// are written in. The scan therefore runs backwards, so that the decorator
+/// the error lands on is the second one a reader meets going down the page and
+/// the note points back up at the first. The survivors come back in
+/// application order, which is the order the values are stored in.
+///
+/// An entry whose `isRepeatable` is set (its base struct conforms to
+/// `RepeatableDecorator`) is exempt: it is never diagnosed and never treated
+/// as a duplicate, no matter how many other entries share its base struct.
+/// `isRepeatable` is a property of the base struct, so every entry sharing
+/// one agrees on it -- there is no need to reconcile conflicting answers for
+/// the same key.
+///
+/// That last sentence used to hold because a decorator struct could not
+/// declare parameters at all. It still holds now that one *site-derived*
+/// parameter is allowed, for a different reason: the binding is the type of
+/// the decorated declaration, and every entry passed to one call of this
+/// function comes from that one declaration. So all entries sharing a base
+/// struct necessarily share the same binding, hence the same type, hence the
+/// same `isRepeatable` answer -- even for a *conditional* `RepeatableDecorator`
+/// conformance, which is evaluated against that same binding. Keying the
+/// duplicate check on the base struct alone therefore remains exact.
+///
+/// The claim would break if a binding were ever allowed to differ between two
+/// decorators on one declaration (inference from constructor arguments, or an
+/// explicit `@serde[T]` at the use site). Both are rejected; if either is ever
+/// allowed, `seen` has to be keyed on (base struct, binding) instead.
+static SmallVector<TypedAttr>
+dedupeDecorators(ArrayRef<EmittedDecorator> decorators,
+                 ArrayRef<ExprNode *> nodes, SharedState &shared) {
+  assert(decorators.size() == nodes.size() && "parallel arrays");
+  llvm::SmallDenseMap<Operation *, ExprNode *> seen;
+  llvm::SmallBitVector isDuplicate(decorators.size());
+  for (size_t i = decorators.size(); i-- > 0;) {
+    if (decorators[i].isRepeatable)
+      continue;
+    StructDeclOp baseStruct = decorators[i].baseStruct;
+    auto [it, inserted] = seen.try_emplace(baseStruct.getOperation(), nodes[i]);
+    if (inserted)
+      continue;
+    isDuplicate[i] = true;
+    auto diag = shared.emitError(nodes[i]->getLoc(), "duplicate decorator '")
+                << baseStruct.getSymName()
+                << "'; at most one decorator per struct is allowed on a "
+                   "declaration"
+                << nodes[i]->getRange();
+    diag.attachNote(it->second->getLoc())
+        << "previous decorator here" << it->second->getRange();
+  }
+
+  SmallVector<TypedAttr> values;
+  values.reserve(decorators.size());
+  for (auto [i, decorator] : llvm::enumerate(decorators))
+    if (!isDuplicate[i])
+      values.push_back(decorator.value);
+  return values;
+}
+
 LogicalResult Decorators::validateCompilerDecorator(TypedAttr attr) {
   constexpr StringRef plainDre[] = {
       "doc_hidden",
@@ -574,8 +960,32 @@ void Decorators::applyBodyDecorators(
   // TODO: Emit an attempt to call the decorator value.
   SmallVector<TypedAttr> decoPValues;
   decoPValues.reserve(exprDecorators.size());
+  SmallVector<EmittedDecorator> userDecorators;
+  SmallVector<ExprNode *> userDecoratorNodes;
   IREmitter emitter(decl, EC_Decorator);
   for (auto *decorator : exprDecorators) {
+    // User-defined decorator values (`@serde(rename="x")` where `serde` is a
+    // struct conforming to `Decorator`) are stored as values and are not
+    // subject to the compiler-decorator allowlist. They are only meaningful on
+    // structs and fields; on functions (and other decls sharing this path) the
+    // existing compiler-decorator path rejects them as before.
+    if (isa_and_nonnull<StructDeclOp>(decl.getIfOperation())) {
+      // A struct decorator's site type is the struct's own `Self` type. This
+      // is read, not computed: `getTypeDeclSelf` returns the type recorded
+      // when the struct's signature was resolved, which is complete long
+      // before body decorators run, so binding it here does not re-enter the
+      // resolution of the struct being decorated.
+      FailureOr<std::optional<EmittedDecorator>> decoratorValue =
+          tryEmitDecoratorValue(decorator, decl, decl.getTypeDeclSelf());
+      if (failed(decoratorValue))
+        continue; // Already diagnosed.
+      if (*decoratorValue) {
+        userDecorators.push_back(**decoratorValue);
+        userDecoratorNodes.push_back(decorator);
+        continue;
+      }
+    }
+
     if (PValue decoVal = emitter.emitExprPValue(decorator, EC_Decorator)) {
       // DecoVal wants the symbol constant attr.
       if (auto fnLit = dyn_cast<FnLiteralTypeGeneratorType>(decoVal.getType()))
@@ -587,6 +997,14 @@ void Decorators::applyBodyDecorators(
       }
       decoPValues.push_back(decoVal);
     }
+  }
+
+  if (!userDecorators.empty()) {
+    SmallVector<TypedAttr> values =
+        dedupeDecorators(userDecorators, userDecoratorNodes, shared);
+    if (auto structDecl = dyn_cast<StructDeclOp>(decl.getIfOperation()))
+      structDecl.setUserDecoratorsAttr(
+          DecoratorsAttr::get(structDecl.getContext(), values));
   }
 
   cast<ASTDeclInterface>(decl.getIfOperation())
@@ -4358,10 +4776,13 @@ LogicalResult DeclResolver::resolveSignature(StructFieldOp fieldOp,
 
   fieldOp.setType(type);
 
-  // Process field decorators syntactically to avoid recursive scope lookups
-  // that can arise when using the IR emitter from within a struct's scope.
-  // Currently only @doc_hidden and @__allow_legacy_any_origin_fields are
-  // supported on struct fields.
+  // Field decorators. The two compiler decorators are matched syntactically.
+  // User-defined decorator values (structs conforming to `Decorator`) are
+  // emitted in the *parent* struct's scope -- the same scope the field type
+  // was parsed in above. Using the field's own decl as the lookup scope would
+  // re-enter this field's resolution and trip the recursion detector.
+  SmallVector<EmittedDecorator> emittedDecorators;
+  SmallVector<ExprNode *> emittedDecoratorNodes;
   for (auto &[decorator, _] : decoratorExprs) {
     if (auto *declRef = dyn_cast<DeclRefNode>(decorator)) {
       if (declRef->spelling == "doc_hidden") {
@@ -4374,9 +4795,30 @@ LogicalResult DeclResolver::resolveSignature(StructFieldOp fieldOp,
         continue;
       }
     }
+
+    // A field decorator's site type is the field's own type, parsed just
+    // above -- and, like the lookup scope, taken from the parent struct's
+    // world rather than from this field's decl, which is still resolving.
+    FailureOr<std::optional<EmittedDecorator>> decoratorValue =
+        tryEmitDecoratorValue(decorator, *decl.getParentDecl(), type);
+    if (failed(decoratorValue))
+      continue; // Already diagnosed.
+    if (*decoratorValue) {
+      emittedDecorators.push_back(**decoratorValue);
+      emittedDecoratorNodes.push_back(decorator);
+      continue;
+    }
+
     shared.emitError(decorator->getLoc(),
                      "decorators not supported on this statement")
         << SourceRange(decorator->getRangeStart(), decorator->getRangeEnd());
+  }
+  if (!emittedDecorators.empty()) {
+    SmallVector<TypedAttr> decoratorValues =
+        dedupeDecorators(emittedDecorators, emittedDecoratorNodes, shared);
+    if (!decoratorValues.empty())
+      fieldOp.setDecoratorsAttr(
+          DecoratorsAttr::get(fieldOp.getContext(), decoratorValues));
   }
 
   shared.notifyListenerOnStructFieldDecl(decl, identifierLoc);

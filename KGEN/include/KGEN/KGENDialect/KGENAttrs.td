@@ -1340,6 +1340,225 @@ def KGEN_StructFieldNamesAttr : KGEN_ExprAttr<"StructFieldNames",
 }
 
 //===----------------------------------------------------------------------===//
+// StructDecoratorTypesAttr
+//===----------------------------------------------------------------------===//
+
+def KGEN_StructDecoratorTypesAttr : KGEN_ExprAttr<"StructDecoratorTypes",
+    "struct_decorator_types",
+    [DeclareAttrInterfaceMethods<ContextuallyEvaluatedAttrInterface,
+                                 ["evaluateWithContext"]>]> {
+  let summary = "Get the user-defined decorator value types of a struct.";
+  let description = [{
+    The `#kgen.struct_decorator_types` attribute returns the *types* of the
+    decorator values applied to a struct declaration (`@serde(...)` where
+    `serde` conforms to `Decorator`) as a param_list of type values, in
+    application order (nearest to the declaration first).
+
+    This is the erased enumeration form; use `#kgen.struct_decorator_of` to
+    retrieve the decorator *value* for a particular decorator type.
+
+    Example:
+
+    ```mlir
+    #kgen.struct_decorator_types<#MyStruct> : !kgen.param_list<!kgen.type>
+    ```
+  }];
+
+  let parameters = (ins
+    "TypedAttr":$typeValue,
+    AttributeSelfTypeParameter<"", "ParamListType">:$type
+  );
+
+  let assemblyFormat = "`<` custom<TypeParamValue>($typeValue) `>`";
+}
+
+//===----------------------------------------------------------------------===//
+// StructDecoratorOfAttr
+//===----------------------------------------------------------------------===//
+
+def KGEN_StructDecoratorOfAttr : KGEN_ExprAttr<"StructDecoratorOf",
+    "struct_decorator_of",
+    [DeclareAttrInterfaceMethods<ContextuallyEvaluatedAttrInterface,
+                                 ["evaluateWithContext"]>]> {
+  let summary = "Get a struct's decorator value of a given decorator type.";
+  let description = [{
+    The `#kgen.struct_decorator_of` attribute returns the decorator value of
+    type `decoratorType` applied to a struct declaration, as a param_list of
+    `decoratorType` holding either zero or one element. At most one decorator
+    per decorator struct is allowed on a declaration -- unless that struct
+    conforms to `RepeatableDecorator`, in which case use
+    `#kgen.struct_decorators_of` instead, since this attribute's 0-or-1 shape
+    cannot represent more than one match.
+
+    Example:
+
+    ```mlir
+    #kgen.struct_decorator_of<#MyStruct, !serde> : !kgen.param_list<!serde>
+    ```
+  }];
+
+  let parameters = (ins
+    "TypedAttr":$typeValue,
+    "TypedAttr":$decoratorType,
+    AttributeSelfTypeParameter<"", "ParamListType">:$type
+  );
+
+  let assemblyFormat = [{
+    `<` custom<TypeParamValue>($typeValue) `,`
+        custom<TypeParamValue>($decoratorType) `>`
+  }];
+}
+
+//===----------------------------------------------------------------------===//
+// StructDecoratorsOfAttr
+//===----------------------------------------------------------------------===//
+
+def KGEN_StructDecoratorsOfAttr : KGEN_ExprAttr<"StructDecoratorsOf",
+    "struct_decorators_of",
+    [DeclareAttrInterfaceMethods<ContextuallyEvaluatedAttrInterface,
+                                 ["evaluateWithContext"]>]> {
+  let summary = "Get all of a struct's decorator values of a given type.";
+  let description = [{
+    The `#kgen.struct_decorators_of` attribute returns every decorator value
+    of type `decoratorType` applied to a struct declaration, as a param_list
+    of `decoratorType` holding zero or more elements, in application order
+    (nearest to the declaration first). This is the plural counterpart of
+    `#kgen.struct_decorator_of`, for a `decoratorType` conforming to
+    `RepeatableDecorator`, which may be applied more than once.
+
+    Example:
+
+    ```mlir
+    #kgen.struct_decorators_of<#MyStruct, !alias_name> : !kgen.param_list<!alias_name>
+    ```
+  }];
+
+  let parameters = (ins
+    "TypedAttr":$typeValue,
+    "TypedAttr":$decoratorType,
+    AttributeSelfTypeParameter<"", "ParamListType">:$type
+  );
+
+  let assemblyFormat = [{
+    `<` custom<TypeParamValue>($typeValue) `,`
+        custom<TypeParamValue>($decoratorType) `>`
+  }];
+}
+
+//===----------------------------------------------------------------------===//
+// StructFieldDecoratorTypesAttr
+//===----------------------------------------------------------------------===//
+
+def KGEN_StructFieldDecoratorTypesAttr :
+    KGEN_ExprAttr<"StructFieldDecoratorTypes", "struct_field_decorator_types",
+    [DeclareAttrInterfaceMethods<ContextuallyEvaluatedAttrInterface,
+                                 ["evaluateWithContext"]>]> {
+  let summary = "Get the user-defined decorator value types of a struct field.";
+  let description = [{
+    The `#kgen.struct_field_decorator_types` attribute returns the *types* of
+    the decorator values applied to the field at `fieldIndex` of a struct
+    type, as a param_list of type values in application order. `fieldIndex`
+    may be any parameter expression that folds to an index (for example a
+    `#kgen.struct_field_index_by_name`). Produces a compile error if the index
+    is out of bounds.
+
+    Example:
+
+    ```mlir
+    #kgen.struct_field_decorator_types<#MyStruct, 0 : index> : !kgen.param_list<!kgen.type>
+    ```
+  }];
+
+  let parameters = (ins
+    "TypedAttr":$typeValue,
+    "TypedAttr":$fieldIndex,
+    AttributeSelfTypeParameter<"", "ParamListType">:$type
+  );
+
+  let assemblyFormat = "`<` custom<TypeParamValue>($typeValue) `,` $fieldIndex `>`";
+}
+
+//===----------------------------------------------------------------------===//
+// StructFieldDecoratorOfAttr
+//===----------------------------------------------------------------------===//
+
+def KGEN_StructFieldDecoratorOfAttr :
+    KGEN_ExprAttr<"StructFieldDecoratorOf", "struct_field_decorator_of",
+    [DeclareAttrInterfaceMethods<ContextuallyEvaluatedAttrInterface,
+                                 ["evaluateWithContext"]>]> {
+  let summary = "Get a struct field's decorator value of a given type.";
+  let description = [{
+    The `#kgen.struct_field_decorator_of` attribute returns the decorator
+    value of type `decoratorType` applied to the field at `fieldIndex` of a
+    struct type, as a param_list of `decoratorType` holding either zero or one
+    element. `fieldIndex` may be any parameter expression that folds to an
+    index. Produces a compile error if the index is out of bounds. At most one
+    decorator per decorator struct is allowed on a declaration -- unless that
+    struct conforms to `RepeatableDecorator`, in which case use
+    `#kgen.struct_field_decorators_of` instead, since this attribute's 0-or-1
+    shape cannot represent more than one match.
+
+    Example:
+
+    ```mlir
+    #kgen.struct_field_decorator_of<#MyStruct, 0 : index, !serde> : !kgen.param_list<!serde>
+    ```
+  }];
+
+  let parameters = (ins
+    "TypedAttr":$typeValue,
+    "TypedAttr":$fieldIndex,
+    "TypedAttr":$decoratorType,
+    AttributeSelfTypeParameter<"", "ParamListType">:$type
+  );
+
+  let assemblyFormat = [{
+    `<` custom<TypeParamValue>($typeValue) `,` $fieldIndex `,`
+        custom<TypeParamValue>($decoratorType) `>`
+  }];
+}
+
+//===----------------------------------------------------------------------===//
+// StructFieldDecoratorsOfAttr
+//===----------------------------------------------------------------------===//
+
+def KGEN_StructFieldDecoratorsOfAttr :
+    KGEN_ExprAttr<"StructFieldDecoratorsOf", "struct_field_decorators_of",
+    [DeclareAttrInterfaceMethods<ContextuallyEvaluatedAttrInterface,
+                                 ["evaluateWithContext"]>]> {
+  let summary = "Get all of a struct field's decorator values of a given type.";
+  let description = [{
+    The `#kgen.struct_field_decorators_of` attribute returns every decorator
+    value of type `decoratorType` applied to the field at `fieldIndex` of a
+    struct type, as a param_list of `decoratorType` holding zero or more
+    elements, in application order (nearest to the declaration first).
+    `fieldIndex` may be any parameter expression that folds to an index.
+    Produces a compile error if the index is out of bounds. This is the
+    plural counterpart of `#kgen.struct_field_decorator_of`, for a
+    `decoratorType` conforming to `RepeatableDecorator`, which may be applied
+    more than once.
+
+    Example:
+
+    ```mlir
+    #kgen.struct_field_decorators_of<#MyStruct, 0 : index, !alias_name> : !kgen.param_list<!alias_name>
+    ```
+  }];
+
+  let parameters = (ins
+    "TypedAttr":$typeValue,
+    "TypedAttr":$fieldIndex,
+    "TypedAttr":$decoratorType,
+    AttributeSelfTypeParameter<"", "ParamListType">:$type
+  );
+
+  let assemblyFormat = [{
+    `<` custom<TypeParamValue>($typeValue) `,` $fieldIndex `,`
+        custom<TypeParamValue>($decoratorType) `>`
+  }];
+}
+
+//===----------------------------------------------------------------------===//
 // StructFieldIndexByNameAttr
 //===----------------------------------------------------------------------===//
 

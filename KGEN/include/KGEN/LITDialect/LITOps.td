@@ -451,6 +451,12 @@ def LIT_StructDeclOp : LITOp<"struct.decl", [
     TypeAttrOf<LIT_TypeSignatureType>:$signature,
     KGEN_ParamDeclArrayAttr:$params,
     KGEN_DecoratorsAttr:$decorators,
+    // User-defined decorators applied to the struct declaration (`@serde(...)`
+    // where `serde` conforms to `Decorator`). Held separately from
+    // `$decorators`, which mixes compiler decorators (function symbols and
+    // `apply` expressions) and cannot be discriminated from user decorators
+    // once those are values rather than type expressions.
+    OptionalAttr<KGEN_DecoratorsAttr>:$userDecorators,
     TypeAttrOf<LIT_TraitType>:$canonicalTrait,
     UnitAttr:$synthetic,
     OptionalAttr<TypeAttr>:$nonmaterializableTarget,
@@ -556,7 +562,12 @@ def LIT_StructFieldOp : LITOp<"struct.field", [
     // Set if the field has an @doc_hidden decorator on it.
     UnitAttr:$isDocHidden,
     // Set if the field allows legacy AnyOrigin usage.
-    UnitAttr:$allowLegacyAnyOrigin
+    UnitAttr:$allowLegacyAnyOrigin,
+    // User-defined decorators applied to the field (`@serde(...)` where
+    // `serde` is a struct conforming to `Decorator`). Each entry is the
+    // decorator *value* the field constructed, nearest to the declaration
+    // first. Absent when the field has no such decorators.
+    OptionalAttr<KGEN_DecoratorsAttr>:$decorators
   );
   let assemblyFormat = "custom<KeywordAsString>($name) attr-dict `:` $type";
 

@@ -26,10 +26,24 @@ are spelled as `reflect[T].method()` (no parens after `[T]`).
 - `field_at[idx]` - `Reflected[FieldT]` for the field at index `idx`.
 - `field_offset[name=...]()` / `field_offset[index=...]()` - byte offset.
 - `field_ref[idx](s)` - reference to field at index `idx` in value `s`.
+- `decorator_types()` - a `TypeList` of the struct's decorator types.
+- `decorator_of[D]()` - the struct's decorator value of type `D`, if present.
+  Rejected at compile time when `D` conforms to `RepeatableDecorator`.
+- `decorators_of[D]()` - every `D` decorator on the struct, nearest-first, for
+  a `D` conforming to `RepeatableDecorator`.
+- `has_decorator[D]()` - whether the struct carries a `D` decorator.
+- `member[name]` - `Member` handle on the named field's *declaration*.
+- `member_at[idx]` - `Member` handle on the field *declaration* at index `idx`.
+
+Note the distinction between `field_at[idx]`, a handle on the field's *type*,
+and `member_at[idx]`, a handle on the field *declaration* itself -- including
+its decorators. `reflect[T].field_at[0]` is the type of the first field;
+`reflect[T].member_at[0]` is the field declaration, from which `.type` reaches
+the same `Reflected[FieldT]` that `field_at[0]` gives directly.
 
 `reflect` is auto-imported via the prelude, so it is available without
-an explicit import. `Reflected[T]` must be imported from `std.reflection`
-when named in signatures.
+an explicit import. `Reflected[T]` and `Member[Owner, idx]` must be imported
+from `std.reflection` when named in signatures.
 
 Example:
 
@@ -61,6 +75,114 @@ from std.builtin.variadics import ParameterList, TypeList
 from std.sys.info import _TargetType, _current_target
 
 
+trait Decorator:
+    """Marker trait for structs that can be used as decorators.
+
+    A struct conforming to `Decorator` may be applied as `@name` or
+    `@name(args)` to a `struct` declaration or to a `var` field inside a
+    struct body. The parenthesized arguments are constructor arguments, and
+    payload is carried by fields. The resulting comptime *value* is recorded
+    on the declaration and exposed through `reflect[T].decorator_of[D]()`.
+    Field-level decorators are retrieved through the `Member` handle, via
+    `reflect[T].member[name]` or `reflect[T].member_at[idx]`.
+
+    At most one decorator of a given type may appear on a single declaration,
+    unless that type conforms to `RepeatableDecorator`, which opts out of the
+    rule.
+
+    Decorators are inert metadata: they never affect layout, type identity,
+    conformances, or code generation.
+
+    A decorator struct may declare **at most one parameter**, which the
+    compiler binds to the type of the declaration the decorator is attached
+    to: the field's type for a field decorator, the struct's own type for a
+    struct decorator. It is never inferred from the constructor arguments and
+    cannot be spelled at the use site, so `@field_dec(rename="n")` and
+    `@field_dec(skip_if=f)` on the same `var name: String` are both
+    `field_dec[String]`. Reading one back means naming that parameterization:
+    `reflect[T].member_at[i].decorator_of[field_dec[String]]()`. Two or more
+    parameters is an error.
+
+    Keep the parameter's trait bound as weak as the payload allows. It is
+    checked at every declaration the decorator is attached to, whatever
+    arguments were passed, so an over-strong bound makes the decorator
+    unusable on whole categories of field. A payload that only *mentions*
+    the parameter in a type -- `Optional[Self.FieldT]` alone, or a function
+    over it -- needs nothing, so `AnyType` suffices; storing a *value* of it
+    needs `Movable & Deinitable`, taking the argument `var` and transferring
+    it with `^`. `ImplicitlyCopyable` is stronger than either and excludes
+    `List` and `Dict` fields, which are `Copyable` but not implicitly so.
+
+    Example:
+        ```mojo
+        struct serde(Decorator):
+            var rename: StaticString
+
+            def __init__(out self, rename: StaticString = ""):
+                self.rename = rename
+
+        struct Thing:
+            @serde(rename="NAME")
+            var name: String
+        ```
+
+    Example:
+        ```mojo
+        def _is_empty(s: String) -> Bool:
+            return s.byte_length() == 0
+
+        struct field_dec[FieldT: AnyType](Decorator):
+            var skip_if: Optional[def (Self.FieldT) thin -> Bool]
+
+            def __init__(
+                out self,
+                skip_if: Optional[def (Self.FieldT) thin -> Bool] = None,
+            ):
+                self.skip_if = skip_if
+
+        struct Serialized:
+            @field_dec(skip_if=_is_empty)
+            var name: String
+
+        def main():
+            comptime d = reflect[Serialized].member_at[0].decorator_of[
+                field_dec[String]
+            ]()
+            comptime assert d.value().skip_if.value()("")
+        ```
+    """
+
+    pass
+
+
+trait RepeatableDecorator(Decorator):
+    """Marker for decorators that may appear more than once on one declaration.
+
+    A `Decorator` may appear at most once per declaration; that is what lets
+    `decorator_of[D]()` return an `Optional[D]` that cannot hide a second
+    match. A decorator conforming to `RepeatableDecorator` opts out of that
+    rule: duplicates are permitted, `decorators_of[D]()` returns all of them
+    nearest-to-declaration first, and `decorator_of[D]()` is rejected at
+    compile time so no spelling can silently return one of several.
+
+    Example:
+        ```mojo
+        struct alias_name(RepeatableDecorator):
+            var wire: StaticString
+
+            def __init__(out self, wire: StaticString):
+                self.wire = wire
+
+        @alias_name("v")
+        @alias_name("verbose")
+        struct Flag:
+            var on: Bool
+        ```
+    """
+
+    pass
+
+
 # ===----------------------------------------------------------------------=== #
 # Implementation primitives
 # ===----------------------------------------------------------------------=== #
@@ -84,6 +206,80 @@ comptime _field_types_of[T: AnyType] = TypeList[
 comptime _field_names_of[T: AnyType] = ParameterList[
     __mlir_attr[
         `#kgen.struct_field_names<`, T, `> : !kgen.param_list<!kgen.string>`
+    ]
+]
+
+comptime _decorator_types_of[T: AnyType] = TypeList[
+    __mlir_attr[
+        `#kgen.struct_decorator_types<`,
+        T,
+        `> : !kgen.param_list<`,
+        Movable,
+        `>`,
+    ]
+]
+
+comptime _decorator_of[T: AnyType, D: AnyType] = ParameterList[
+    __mlir_attr[
+        `#kgen.struct_decorator_of<`,
+        T,
+        `, `,
+        D,
+        `> : !kgen.param_list<`,
+        D,
+        `>`,
+    ]
+]
+
+comptime _decorators_of[T: AnyType, D: AnyType] = ParameterList[
+    __mlir_attr[
+        `#kgen.struct_decorators_of<`,
+        T,
+        `, `,
+        D,
+        `> : !kgen.param_list<`,
+        D,
+        `>`,
+    ]
+]
+
+comptime _field_decorator_types_of[T: AnyType, idx: Int] = TypeList[
+    __mlir_attr[
+        `#kgen.struct_field_decorator_types<`,
+        T,
+        `, `,
+        idx.__mlir_index__(),
+        `> : !kgen.param_list<`,
+        Movable,
+        `>`,
+    ]
+]
+
+comptime _field_decorator_of[T: AnyType, idx: Int, D: AnyType] = ParameterList[
+    __mlir_attr[
+        `#kgen.struct_field_decorator_of<`,
+        T,
+        `, `,
+        idx.__mlir_index__(),
+        `, `,
+        D,
+        `> : !kgen.param_list<`,
+        D,
+        `>`,
+    ]
+]
+
+comptime _field_decorators_of[T: AnyType, idx: Int, D: AnyType] = ParameterList[
+    __mlir_attr[
+        `#kgen.struct_field_decorators_of<`,
+        T,
+        `, `,
+        idx.__mlir_index__(),
+        `, `,
+        D,
+        `> : !kgen.param_list<`,
+        D,
+        `>`,
     ]
 ]
 
@@ -302,6 +498,167 @@ struct Reflected[T: AnyType]:
         return {}
 
     @staticmethod
+    def decorator_types() -> _decorator_types_of[Self.T]:
+        """Returns the types of the decorators applied to struct `T`.
+
+        A decorator is a struct conforming to `Decorator`, applied as `@name`
+        or `@name(args)`. Entries are the decorator types, nearest to the
+        declaration first. At most one decorator of a given type may appear
+        on a declaration -- unless that type conforms to
+        `RepeatableDecorator`, in which case it may appear (and so be
+        repeated in this list) more than once. Undecorated structs yield an
+        empty list.
+
+        Use this to enumerate what is present; use `decorator_of` to read a
+        non-repeatable decorator's value, or `decorators_of` for a repeatable
+        one. An enumerate-then-fetch loop that calls `decorator_of[tys[i]]()`
+        for every entry hard-errors at compile time if any enumerated type
+        happens to conform to `RepeatableDecorator` -- `decorator_of` rejects
+        that unconditionally (see below). There is no single call that is
+        always safe to make blind; a generic enumerate-then-fetch loop should
+        either know its decorator types are all non-repeatable, or branch on
+        `conforms_to(tys[i], RepeatableDecorator)` and use `decorators_of`
+        for the repeatable ones. Note that a repeatable type appears in this
+        list once per occurrence, so such a loop visits it more than once and
+        `decorators_of` returns every occurrence each time; dedupe the list
+        first if occurrences must be counted once.
+
+        Constraints:
+            None. A non-struct `T` -- or a struct with no decorators -- yields
+            an empty list rather than erroring, so a generic caller can ask
+            without knowing what `T` is.
+
+        Returns:
+            A `TypeList` with one entry per decorator on the struct.
+
+        Example:
+            ```mojo
+            @fieldwise_init
+            struct tag(Decorator):
+                pass
+
+            @tag
+            struct Thing:
+                var x: Int
+
+            def main():
+                comptime tys = reflect[Thing].decorator_types()
+                comptime assert tys[0] == tag
+            ```
+        """
+        return {}
+
+    @staticmethod
+    def decorator_of[D: Movable]() -> Optional[D]:
+        """Returns the `D` decorator applied to struct `T`, if present.
+
+        Constraints:
+            `T` must be a struct type. `D` must be `Movable` -- every
+            decorator value already is, since it must be a legal comptime
+            parameter value to have been recorded in the first place. `D`
+            must not conform to `RepeatableDecorator`; use `decorators_of`
+            for those.
+
+        Parameters:
+            D: The decorator type to look for.
+
+        Returns:
+            The decorator value, or `None` when `T` carries no `D`.
+
+        Example:
+            ```mojo
+            struct serde(Decorator):
+                var rename: StaticString
+
+                def __init__(out self, rename: StaticString = ""):
+                    self.rename = rename
+
+            @serde(rename="NAME")
+            struct Thing:
+                var x: Int
+
+            def main():
+                comptime d = reflect[Thing].decorator_of[serde]()
+                comptime assert Bool(d)
+                comptime assert d.value().rename == "NAME"
+            ```
+        """
+        comptime assert not conforms_to(D, RepeatableDecorator), String(
+            t"decorator_of[D]() cannot be used with a decorator conforming"
+            t" to RepeatableDecorator; a repeatable decorator may appear"
+            t" more than once, so no spelling can safely return only one."
+            t" Use decorators_of[D]() instead."
+        )
+        comptime found = _decorator_of[Self.T, D]()
+        comptime if found.size == 0:
+            return None
+        else:
+            return materialize[found[0]]()
+
+    @staticmethod
+    def decorators_of[D: Movable]() -> _decorators_of[Self.T, D]:
+        """Returns every `D` decorator applied to struct `T`, nearest-first.
+
+        For a decorator conforming to `RepeatableDecorator`, which may appear
+        more than once on a single declaration. A non-repeatable decorator
+        can appear at most once, so use `decorator_of[D]()` for those.
+
+        Constraints:
+            `T` must be a struct type. `D` must be `Movable` -- every
+            decorator value already is, since it must be a legal comptime
+            parameter value to have been recorded in the first place.
+
+        Parameters:
+            D: The decorator type to look for.
+
+        Returns:
+            A `ParameterList` with one entry per occurrence of `D` on the
+            struct, nearest to the declaration first; empty when absent.
+
+        Example:
+            ```mojo
+            struct alias_name(RepeatableDecorator):
+                var wire: StaticString
+
+                def __init__(out self, wire: StaticString):
+                    self.wire = wire
+
+            @alias_name("v")
+            @alias_name("verbose")
+            struct Flag:
+                var on: Bool
+
+            def main():
+                comptime ds = reflect[Flag].decorators_of[alias_name]()
+                comptime assert ds.size == 2
+                comptime assert ds[0].wire == "verbose"
+                comptime assert ds[1].wire == "v"
+            ```
+        """
+        return {}
+
+    @staticmethod
+    def has_decorator[D: AnyType]() -> Bool:
+        """Returns whether struct `T` carries a `D` decorator.
+
+        Constraints:
+            `T` must be a struct type.
+
+        Parameters:
+            D: The decorator type to look for.
+
+        Returns:
+            `True` when `T` carries a `D` decorator.
+        """
+        # Goes through the plural query, not `_decorator_of`: this must keep
+        # working for a `D` conforming to `RepeatableDecorator`, which can
+        # have more than one match -- `_decorator_of`'s folder now rejects
+        # that (defense in depth for `decorator_of`'s at-most-one contract),
+        # so routing a boolean "is there at least one" check through it would
+        # hard-error instead of answering `True`.
+        return _decorators_of[Self.T, D]().size > 0
+
+    @staticmethod
     def field_names() -> Array[StaticString, _field_types_of[Self.T]().length]:
         """Returns the names of all fields in struct `T`.
 
@@ -411,6 +768,51 @@ struct Reflected[T: AnyType]:
             comptime y_type = reflect[Point].field_at[1]
             var v: y_type.T = 3.14  # y_type.T is Float64
         ```
+    """
+
+    comptime member[name: StringLiteral] = Member[
+        Self.T,
+        Int(
+            mlir_value=__mlir_attr[
+                `#kgen.struct_field_index_by_name<`,
+                Self.T,
+                `, `,
+                name.value,
+                `> : index`,
+            ]
+        ),
+    ]
+    """A declaration handle on the named field.
+
+    Distinct from `field[name]`, which is a handle on the field's *type*:
+    `reflect[T].member["x"]` is a handle on the field declaration itself,
+    including its decorators, while `reflect[T].field["x"]` is
+    `Reflected[FieldT]` for the field's type directly. Reach the type from a
+    member through `.type`.
+
+    Note: `T` must be a concrete type, not a generic type parameter, when
+    looking up by name.
+
+    Parameters:
+        name: The name of the field.
+    """
+
+    # A separate name (not an overload of `member`) because `comptime`
+    # member aliases cannot be overloaded on parameter type -- the same
+    # constraint that forces `field` and `field_at` apart.
+    comptime member_at[idx: Int] = Member[Self.T, idx]
+    """A declaration handle on the field at the given index.
+
+    The by-index dual of `member[name]`. Unlike the by-name form it works
+    when only the index is available, such as inside a `comptime for` over
+    `field_count()`, and `T` may be a generic type parameter.
+
+    Distinct from `field_at[idx]`, which is a handle on the field's *type*:
+    `reflect[T].member_at[0]` is a handle on the field declaration, while
+    `reflect[T].field_at[0]` is `Reflected[FieldT]` for its type directly.
+
+    Parameters:
+        idx: The zero-based index of the field.
     """
 
     # `nodebug` (not `builtin`) because the body emits a `lit.ref.struct.ger`
@@ -545,3 +947,139 @@ struct Reflected[T: AnyType]:
                 `> : index`,
             ]
         )
+
+
+struct Member[Owner: AnyType, idx: Int]:
+    """A compile-time handle on a field *declaration* of struct `Owner`.
+
+    Distinct from `Reflected[FieldT]`, which is a handle on the field's
+    *type*: `reflect[T].member_at[0].decorator_of[serde]()` asks about the
+    field declaration itself, while `reflect[T].field_at[0]` is the field's
+    type. Reach the type from a member through `.type`.
+
+    Obtain one from `reflect[T].member[name]` or `reflect[T].member_at[idx]`
+    rather than constructing it directly.
+
+    Parameters:
+        Owner: The struct type the field belongs to.
+        idx: The zero-based index of the field.
+
+    Example:
+        ```mojo
+        struct serde(Decorator):
+            var rename: StaticString
+
+            def __init__(out self, rename: StaticString = ""):
+                self.rename = rename
+
+        struct Thing:
+            @serde(rename="NAME")
+            var name: String
+
+        def main():
+            comptime d = reflect[Thing].member_at[0].decorator_of[serde]()
+            comptime assert Bool(d)
+            comptime assert d.value().rename == "NAME"
+        ```
+    """
+
+    comptime index = Self.idx
+    """The zero-based index of this field within `Owner`."""
+
+    comptime type = Reflected[_field_types_of[Self.Owner]()[Self.idx]]
+    """A `Reflected` handle on this field's type."""
+
+    @staticmethod
+    def name() -> StaticString:
+        """Returns the name of this field.
+
+        Returns:
+            The field's declared name.
+        """
+        return Reflected[Self.Owner].field_names()[Self.idx]
+
+    @staticmethod
+    def decorator_types() -> _field_decorator_types_of[Self.Owner, Self.idx]:
+        """Returns the types of the decorators applied to this field.
+
+        Entries are the decorator types, nearest to the declaration first.
+        At most one decorator of a given type may appear on a declaration --
+        unless that type conforms to `RepeatableDecorator`, in which case it
+        may appear (and so be repeated in this list) more than once. An
+        undecorated field yields an empty list.
+
+        As with the struct-level form, an enumerate-then-fetch loop over
+        these entries that calls `decorator_of[tys[i]]()` hard-errors at
+        compile time if any entry conforms to `RepeatableDecorator` -- see
+        the note on `Reflected.decorator_types`.
+
+        Returns:
+            A `TypeList` with one entry per decorator on the field.
+        """
+        return {}
+
+    @staticmethod
+    def decorator_of[D: Movable]() -> Optional[D]:
+        """Returns the `D` decorator applied to this field, if present.
+
+        Constraints:
+            `D` must be `Movable` -- every decorator value already is, since
+            it must be a legal comptime parameter value to have been recorded
+            in the first place. `D` must not conform to `RepeatableDecorator`;
+            use `decorators_of` for those.
+
+        Parameters:
+            D: The decorator type to look for.
+
+        Returns:
+            The decorator value, or `None` when the field carries no `D`.
+        """
+        comptime assert not conforms_to(D, RepeatableDecorator), String(
+            t"decorator_of[D]() cannot be used with a decorator conforming"
+            t" to RepeatableDecorator; a repeatable decorator may appear"
+            t" more than once, so no spelling can safely return only one."
+            t" Use decorators_of[D]() instead."
+        )
+        comptime found = _field_decorator_of[Self.Owner, Self.idx, D]()
+        comptime if found.size == 0:
+            return None
+        else:
+            return materialize[found[0]]()
+
+    @staticmethod
+    def decorators_of[
+        D: Movable
+    ]() -> _field_decorators_of[Self.Owner, Self.idx, D]:
+        """Returns every `D` decorator applied to this field, nearest-first.
+
+        For a decorator conforming to `RepeatableDecorator`, which may appear
+        more than once on a single declaration. A non-repeatable decorator
+        can appear at most once, so use `decorator_of[D]()` for those.
+
+        Constraints:
+            `D` must be `Movable` -- every decorator value already is, since
+            it must be a legal comptime parameter value to have been recorded
+            in the first place.
+
+        Parameters:
+            D: The decorator type to look for.
+
+        Returns:
+            A `ParameterList` with one entry per occurrence of `D` on the
+            field, nearest to the declaration first; empty when absent.
+        """
+        return {}
+
+    @staticmethod
+    def has_decorator[D: AnyType]() -> Bool:
+        """Returns whether this field carries a `D` decorator.
+
+        Parameters:
+            D: The decorator type to look for.
+
+        Returns:
+            `True` when the field carries a `D` decorator.
+        """
+        # See `Reflected.has_decorator`: goes through the plural query so
+        # this keeps working for a repeatable `D` with more than one match.
+        return _field_decorators_of[Self.Owner, Self.idx, D]().size > 0

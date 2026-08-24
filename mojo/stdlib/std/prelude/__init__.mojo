@@ -181,7 +181,7 @@ from std.origin import (
     MutUnsafeAnyOrigin,
     ImmUnsafeAnyOrigin,
 )
-from std.reflection import reflect
+from std.reflection import Decorator, RepeatableDecorator, reflect
 from std.traits import (
     AnyType,
     Copyable,

@@ -529,11 +529,11 @@ struct StringSpan[mut: Bool, //, origin: Origin[mut=mut]](
 
     @implicit
     def __init__(out self: StaticString, lit: StringLiteral):
-        pass
+        self._slice = {}
 
     @always_inline
     def __init__(out self: StaticString, _kgen: __mlir_type.`!kgen.string`):
-        pass
+        self._slice = {}
 
     @always_inline
     def unsafe_ptr(
@@ -890,6 +890,14 @@ trait Deinitable:
         ...
 
     comptime __del__is_trivial: Bool
+
+
+trait Decorator:
+    pass
+
+
+trait RepeatableDecorator(Decorator):
+    pass
 
 
 # ===-----------------------------------------------------------------------===#
