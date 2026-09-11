@@ -38,6 +38,7 @@ __author__ = "Guido van Rossum <guido@python.org>"
 __all__ = ["Driver", "load_grammar"]
 
 # Python imports
+import hashlib
 import io
 import logging
 import os
@@ -669,11 +670,30 @@ class Driver:
         return "".join(lines), current_line
 
 
+def _grammar_digest(gt: Path) -> str:
+    """Return a short hash of the grammar's text, or "" if it is not a file.
+
+    The cache directory is shared by every mblack install on the machine, and
+    the pickle name is otherwise just the grammar's basename plus the Python
+    version -- so two toolchains whose grammars differ still resolve to one
+    file and silently overwrite each other's work. Keying on the contents
+    keeps them apart.
+    """
+    if not os.path.isfile(gt):
+        return ""
+    try:
+        with open(gt, "rb") as source:
+            return "." + hashlib.sha256(source.read()).hexdigest()
+    except OSError:
+        return ""
+
+
 def _generate_pickle_name(gt: Path, cache_dir: Path | None = None) -> str:
     head, tail = os.path.splitext(gt)
     if tail == ".txt":
         tail = ""
-    name = head + tail + ".".join(map(str, sys.version_info)) + ".pickle"
+    version = ".".join(map(str, sys.version_info))
+    name = head + tail + version + _grammar_digest(gt) + ".pickle"
     if cache_dir:
         return os.path.join(cache_dir, os.path.basename(name))
     else:
